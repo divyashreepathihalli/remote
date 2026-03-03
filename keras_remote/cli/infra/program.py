@@ -116,7 +116,7 @@ def create_program(config):
         enabled=True,
         autoscaling_profile="OPTIMIZE_UTILIZATION",
         auto_provisioning_defaults=gcp.container.ClusterClusterAutoscalingAutoProvisioningDefaultsArgs(
-          oauth_scopes=_BASE_OAUTH_SCOPES,
+          oauth_scopes=_DEFAULT_POOL_OAUTH_SCOPES,
           management=gcp.container.ClusterClusterAutoscalingAutoProvisioningDefaultsManagementArgs(
             auto_upgrade=True,
             auto_repair=True,
@@ -130,6 +130,14 @@ def create_program(config):
           gcp.container.ClusterClusterAutoscalingResourceLimitArgs(
             resource_type="memory",
             maximum=64000,
+          ),
+          gcp.container.ClusterClusterAutoscalingResourceLimitArgs(
+            resource_type="nvidia.com/gpu",
+            maximum=100,
+          ),
+          gcp.container.ClusterClusterAutoscalingResourceLimitArgs(
+            resource_type="google.com/tpu",
+            maximum=100,
           ),
         ],
       ),
@@ -214,7 +222,7 @@ def _create_gpu_node_pool(cluster, gpu: GpuConfig, zone, project_id, pool_name):
     initial_node_count=0,
     autoscaling=gcp.container.NodePoolAutoscalingArgs(
       min_node_count=0,
-      max_node_count=1,
+      max_node_count=10,
     ),
     management=gcp.container.NodePoolManagementArgs(
       auto_repair=True,
@@ -239,12 +247,15 @@ def _create_tpu_node_pool(cluster, tpu: TpuConfig, zone, project_id, pool_name):
   """Create a TPU GKE node pool."""
   # Single-host TPU slices (1 node) must not specify placement_policy;
   # multi-host slices require COMPACT placement with an explicit topology.
+  is_multi_host = tpu.num_nodes > 1
+  min_nodes = tpu.num_nodes if is_multi_host else 0
+
   placement = (
     gcp.container.NodePoolPlacementPolicyArgs(
       type="COMPACT",
       tpu_topology=tpu.topology,
     )
-    if tpu.num_nodes > 1
+    if is_multi_host
     else None
   )
   return gcp.container.NodePool(
@@ -253,9 +264,9 @@ def _create_tpu_node_pool(cluster, tpu: TpuConfig, zone, project_id, pool_name):
     cluster=cluster.name,
     location=zone,
     project=project_id,
-    initial_node_count=tpu.num_nodes if tpu.num_nodes > 1 else 0,
+    initial_node_count=min_nodes,
     autoscaling=gcp.container.NodePoolAutoscalingArgs(
-      min_node_count=tpu.num_nodes if tpu.num_nodes > 1 else 0,
+      min_node_count=min_nodes,
       max_node_count=tpu.num_nodes,
     ),
     management=gcp.container.NodePoolManagementArgs(

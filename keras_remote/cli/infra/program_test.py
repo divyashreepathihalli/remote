@@ -312,6 +312,12 @@ class TestClusterAutoscalingAndNAP(absltest.TestCase):
       gcp_mock.container.ClusterClusterAutoscalingResourceLimitArgs.assert_any_call(
         resource_type="memory", maximum=64000
       )
+      gcp_mock.container.ClusterClusterAutoscalingResourceLimitArgs.assert_any_call(
+        resource_type="nvidia.com/gpu", maximum=100
+      )
+      gcp_mock.container.ClusterClusterAutoscalingResourceLimitArgs.assert_any_call(
+        resource_type="google.com/tpu", maximum=100
+      )
 
 
 class TestScaleToZeroNodePools(parameterized.TestCase):
@@ -321,7 +327,7 @@ class TestScaleToZeroNodePools(parameterized.TestCase):
     dict(
       testcase_name="gpu",
       accelerator=GpuConfig("l4", 1, "nvidia-l4", "g2-standard-4"),
-      expected_max_count=1,
+      expected_max_count=10,
     ),
     dict(
       testcase_name="tpu_v5p",

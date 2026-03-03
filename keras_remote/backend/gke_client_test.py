@@ -377,7 +377,7 @@ class TestCheckPodScheduling(parameterized.TestCase):
     dict(
       testcase_name="node_selector_mismatch",
       condition_message="didn't match Pod's node affinity/selector",
-      log_match="match accelerator selector 'cloud.google.com/gke-accelerator: nvidia-l4'",
+      log_match="Selector: cloud.google.com/gke-accelerator: nvidia-l4",
       node_selector={"cloud.google.com/gke-accelerator": "nvidia-l4"},
     ),
   )
@@ -389,7 +389,7 @@ class TestCheckPodScheduling(parameterized.TestCase):
     pod = self._make_pending_pod(condition_message, node_selector=node_selector)
     mock_core.list_namespaced_pod.return_value.items = [pod]
 
-    _check_pod_scheduling(mock_core, "job-1", "default")
+    _check_pod_scheduling(mock_core, "job-1", "default", set())
 
     # Verify it was called with something that contains log_match
     self.assertTrue(mock_info.called)
@@ -403,7 +403,9 @@ class TestCheckPodScheduling(parameterized.TestCase):
     pod.status.conditions = []
     mock_core.list_namespaced_pod.return_value.items = [pod]
 
-    _check_pod_scheduling(mock_core, "job-1", "default")  # should not raise
+    _check_pod_scheduling(
+      mock_core, "job-1", "default", set()
+    )  # should not raise
 
   def test_pending_no_conditions(self):
     mock_core = MagicMock()
@@ -412,7 +414,9 @@ class TestCheckPodScheduling(parameterized.TestCase):
     pod.status.conditions = None
     mock_core.list_namespaced_pod.return_value.items = [pod]
 
-    _check_pod_scheduling(mock_core, "job-1", "default")  # should not raise
+    _check_pod_scheduling(
+      mock_core, "job-1", "default", set()
+    )  # should not raise
 
 
 if __name__ == "__main__":

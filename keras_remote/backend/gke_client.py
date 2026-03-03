@@ -1,5 +1,6 @@
 """GKE job submission for keras_remote."""
 
+import functools
 import json
 import subprocess
 import time
@@ -110,6 +111,7 @@ def wait_for_job(job, namespace="default", timeout=3600, poll_interval=10):
   job_name = job.metadata.name
   start_time = time.time()
   logged_running = False
+  logged_pending = set()
 
   with LogStreamer(core_v1, namespace) as streamer:
     while True:
@@ -135,7 +137,7 @@ def wait_for_job(job, namespace="default", timeout=3600, poll_interval=10):
         raise RuntimeError(f"GKE job {job_name} failed")
 
       # Check for pod scheduling issues
-      _check_pod_scheduling(core_v1, job_name, namespace)
+      _check_pod_scheduling(core_v1, job_name, namespace, logged_pending)
 
       # Start log streaming when pod is running
       with suppress(ApiException):
@@ -396,40 +398,70 @@ def _print_pod_logs(core_v1, job_name, namespace):
         logging.info("Pod %s logs:\n%s", pod.metadata.name, logs)
 
 
-def _validate_node_pool_exists(selector: dict) -> bool:
+@functools.lru_cache(maxsize=16)
+def _check_node_pool_exists_cached(selector_items) -> bool:
   """Use gcloud to verify that a GKE NodePool matches the pod node selector."""
+  selector = dict(selector_items)
   try:
-    # Requires gcloud CLI and valid credentials.
-    out = subprocess.check_output(
-      ["gcloud", "container", "node-pools", "list", "--format", "json"],
-      text=True,
-      stderr=subprocess.DEVNULL,
-    )
+    cmd = ["gcloud", "container", "node-pools", "list", "--format", "json"]
+
+    # Attempt to extract exact cluster context from kubeconfig
+    try:
+      _, active_context = config.kube_config.list_kube_config_contexts()
+      context_name = active_context.get("name", "")
+      if context_name.startswith("gke_"):
+        parts = context_name.split("_")
+        if len(parts) >= 4:
+          project = parts[1]
+          location = parts[2]
+          cluster = "_".join(parts[3:])
+          cmd.extend(
+            ["--cluster", cluster, "--location", location, "--project", project]
+          )
+    except Exception:
+      pass
+
+    out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
     pools = json.loads(out)
     for pool in pools:
-      config = pool.get("config", {})
-      labels = config.get("labels", {})
-      # Check if all keys/values in the selector exist in this pool's labels
-      if all(labels.get(k) == str(v) for k, v in selector.items()):
+      pool_labels = pool.get("config", {}).get("labels", {})
+      if all(pool_labels.get(k) == str(v) for k, v in selector.items()):
         return True
     return False
   except Exception:
-    # If gcloud is missing or unauthenticated, degrade gracefully and assume pool exists
+    # Degrade gracefully
     return True
 
 
-def _check_pod_scheduling(core_v1, job_name, namespace):
+def _validate_node_pool_exists(selector: dict) -> bool:
+  if not selector:
+    return True
+  return _check_node_pool_exists_cached(tuple(sorted(selector.items())))
+
+
+def _check_pod_scheduling(core_v1, job_name, namespace, logged_pending):
   """Check for pod scheduling issues and raise helpful errors."""
   with suppress(ApiException):
     pods = core_v1.list_namespaced_pod(
       namespace, label_selector=f"job-name={job_name}"
     )
     for pod in pods.items:
+      pod_name = pod.metadata.name
       if pod.status.phase == "Pending":
         for condition in pod.status.conditions or []:
           if condition.type == "PodScheduled" and condition.status == "False":
             msg = condition.message or ""
-            if "Insufficient nvidia.com/gpu" in msg:
+
+            is_insufficient = (
+              "Insufficient nvidia.com/gpu" in msg
+              or "Insufficient google.com/tpu" in msg
+            )
+            is_mismatch = (
+              "didn't match Pod's node affinity/selector" in msg
+              or "node selector" in msg.lower()
+            )
+
+            if is_insufficient or is_mismatch:
               selector = pod.spec.node_selector or {}
               if not _validate_node_pool_exists(selector):
                 selector_str = (
@@ -441,31 +473,17 @@ def _check_pod_scheduling(core_v1, job_name, namespace):
                   f"No GKE node pool exists with selector '{selector_str}'. "
                   "Please use 'keras-remote pool add' to configure this accelerator."
                 )
-              logging.info(
-                f"Pod {pod.metadata.name} is Pending: Insufficient nvidia.com/gpu. "
-                "Waiting for GKE Cluster Autoscaler to provision a new node... (scale-to-zero)\n"
-                "  Note: If this hangs indefinitely, ensure your GCP project has adequate quota."
-              )
-            elif (
-              "didn't match Pod's node affinity/selector" in msg
-              or "node selector" in msg.lower()
-            ):
-              selector = pod.spec.node_selector or {}
-              selector_str = (
-                ", ".join([f"{k}: {v}" for k, v in selector.items()])
-                if selector
-                else "None"
-              )
 
-              if not _validate_node_pool_exists(selector):
-                raise RuntimeError(
-                  f"No GKE node pool exists with selector '{selector_str}'. "
-                  "Please use 'keras-remote pool add' to configure this accelerator."
+              if pod_name not in logged_pending:
+                selector_str = (
+                  ", ".join([f"{k}: {v}" for k, v in selector.items()])
+                  if selector
+                  else "None"
                 )
-
-              logging.info(
-                f"Pod {pod.metadata.name} is Pending: No currently running nodes "
-                f"match accelerator selector '{selector_str}'. "
-                "Waiting for GKE Cluster Autoscaler to provision a new node... (scale-to-zero)\n"
-                "  Note: If this hangs indefinitely, ensure your GCP project has adequate quota."
-              )
+                logging.info(
+                  f"Pod {pod_name} is Pending: {msg.split('. ')[0]}.\n"
+                  f"  Selector: {selector_str}\n"
+                  "  Waiting for GKE Cluster Autoscaler to provision a new node... (scale-to-zero)\n"
+                  "  Note: If this hangs indefinitely, ensure your GCP project has adequate quota."
+                )
+                logged_pending.add(pod_name)
