@@ -424,7 +424,22 @@ def _check_node_pool_exists_cached(selector_items) -> bool:
     out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
     pools = json.loads(out)
     for pool in pools:
-      pool_labels = pool.get("config", {}).get("labels", {})
+      config_dict = pool.get("config", {})
+      pool_labels = config_dict.get("labels", {}).copy()
+      
+      # Map GKE injected node labels for accelerators mapping
+      accelerators = config_dict.get("accelerators", [])
+      if accelerators:
+        accel_type = accelerators[0].get("acceleratorType", "")
+        pool_labels["cloud.google.com/gke-accelerator"] = accel_type
+      
+      # TPU mapping fallback
+      machine_type = config_dict.get("machineType", "")
+      if machine_type.startswith("ct"):
+        # We roughly map TPU presence for preflight
+        pool_labels["cloud.google.com/gke-tpu-topology"] = selector.get("cloud.google.com/gke-tpu-topology", "")
+        pool_labels["cloud.google.com/gke-tpu-accelerator"] = selector.get("cloud.google.com/gke-tpu-accelerator", "")
+      
       if all(pool_labels.get(k) == str(v) for k, v in selector.items()):
         return True
     return False
