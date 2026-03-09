@@ -45,7 +45,7 @@ class TestParseGpuMultiCount(absltest.TestCase):
     self.assertEqual(result.count, 4)
 
   def test_l4_dash_2(self):
-    # This remains supported because we just check ^([^x]+)(?:x)(\d+)$ 
+    # This remains supported because we just check ^([^x]+)(?:x)(\d+)$
     # WAIT! we removed the - check so let's adjust this test to correctly use x2
     result = parse_accelerator("gpu:l4x2")
     self.assertIsInstance(result, GpuConfig)
@@ -65,7 +65,6 @@ class TestParseGpuAlias(absltest.TestCase):
     self.assertIsInstance(result, GpuConfig)
     self.assertEqual(result.name, "v100")
     self.assertEqual(result.count, 4)
-
 
   def test_gpu_prefix_a100x4(self):
     result = parse_accelerator("gpu:a100x4")

@@ -62,53 +62,77 @@ class TpuSpec:
 
 
 GPUS: dict[str, GpuSpec] = {
-  "l4": GpuSpec("nvidia-l4", {
+  "l4": GpuSpec(
+    "nvidia-l4",
+    {
       1: "g2-standard-4",
       2: "g2-standard-24",
       4: "g2-standard-48",
       8: "g2-standard-96",
-  }),
-  "t4": GpuSpec("nvidia-tesla-t4", {
+    },
+  ),
+  "t4": GpuSpec(
+    "nvidia-tesla-t4",
+    {
       1: "n1-standard-4",
       2: "n1-standard-8",
       4: "n1-standard-16",
-  }),
-  "v100": GpuSpec("nvidia-tesla-v100", {
+    },
+  ),
+  "v100": GpuSpec(
+    "nvidia-tesla-v100",
+    {
       1: "n1-standard-8",
       2: "n1-standard-16",
       4: "n1-standard-32",
       8: "n1-standard-64",
-  }),
-  "a100": GpuSpec("nvidia-tesla-a100", {
+    },
+  ),
+  "a100": GpuSpec(
+    "nvidia-tesla-a100",
+    {
       1: "a2-highgpu-1g",
       2: "a2-highgpu-2g",
       4: "a2-highgpu-4g",
       8: "a2-highgpu-8g",
       16: "a2-megagpu-16g",
-  }),
-  "a100-80gb": GpuSpec("nvidia-a100-80gb", {
+    },
+  ),
+  "a100-80gb": GpuSpec(
+    "nvidia-a100-80gb",
+    {
       1: "a2-ultragpu-1g",
       2: "a2-ultragpu-2g",
       4: "a2-ultragpu-4g",
       8: "a2-ultragpu-8g",
       16: "a2-ultragpu-16g",
-  }),
-  "h100": GpuSpec("nvidia-h100-80gb", {
+    },
+  ),
+  "h100": GpuSpec(
+    "nvidia-h100-80gb",
+    {
       1: "a3-highgpu-1g",
       2: "a3-highgpu-2g",
       4: "a3-highgpu-4g",
       8: "a3-highgpu-8g",
-  }),
-  "p4": GpuSpec("nvidia-tesla-p4", {
+    },
+  ),
+  "p4": GpuSpec(
+    "nvidia-tesla-p4",
+    {
       1: "n1-standard-4",
       2: "n1-standard-8",
       4: "n1-standard-16",
-  }),
-  "p100": GpuSpec("nvidia-tesla-p100", {
+    },
+  ),
+  "p100": GpuSpec(
+    "nvidia-tesla-p100",
+    {
       1: "n1-standard-4",
       2: "n1-standard-8",
       4: "n1-standard-16",
-  }),
+    },
+  ),
 }
 
 _GPU_ALIASES: dict[str, str] = {
@@ -264,7 +288,9 @@ def parse_accelerator(accel_str: str) -> Accelerator:
       if gpu_name in GPUS and count in GPUS[gpu_name].counts:
         return make_gpu(gpu_name, count)
     if is_gpu_explicit:
-      valid_counts = sorted(set(c for spec in GPUS.values() for c in spec.counts))
+      valid_counts = sorted(
+        set(c for spec in GPUS.values() for c in spec.counts)
+      )
       raise ValueError(
         f"No GPU supports count {count}. Supported counts: {valid_counts}"
       )
