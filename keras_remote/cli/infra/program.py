@@ -8,12 +8,12 @@ import pulumi
 import pulumi_gcp as gcp
 
 from keras_remote.cli.constants import (
+  GPU_NODE_POOL_MAX_SCALE_UP,
   MAX_CLUSTER_CPU,
   MAX_CLUSTER_MEMORY_GB,
   NODE_MAX_RUN_DURATION_SECONDS,
   REQUIRED_APIS,
   RESOURCE_NAME_PREFIX,
-  GPU_NODE_POOL_MAX_SCALE_UP,
 )
 from keras_remote.constants import zone_to_ar_location, zone_to_region
 from keras_remote.core.accelerators import GpuConfig, TpuConfig
