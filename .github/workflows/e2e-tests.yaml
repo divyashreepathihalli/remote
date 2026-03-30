@@ -54,13 +54,16 @@ jobs:
           location: ${{ secrets.GKE_ZONE }}
           project_id: ${{ secrets.GCP_PROJECT }}
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
       - name: Install dependencies
-        run: pip install -e ".[test,cli]"
+        run: uv pip install --system -e ".[test,cli]"
 
       - name: Run E2E tests
         env:
           E2E_TESTS: "1"
-          KERAS_REMOTE_PROJECT: ${{ secrets.GCP_PROJECT }}
-          KERAS_REMOTE_ZONE: ${{ secrets.GKE_ZONE }}
-          KERAS_REMOTE_CLUSTER: ${{ secrets.GKE_CLUSTER }}
+          KINETIC_PROJECT: ${{ secrets.GCP_PROJECT }}
+          KINETIC_ZONE: ${{ secrets.GKE_ZONE }}
+          KINETIC_CLUSTER: ${{ secrets.GKE_CLUSTER }}
         run: python -m pytest tests/e2e/ -v -n auto

@@ -1,5 +1,6 @@
 """Pathways (LeaderWorkerSet) job submission for kinetic."""
 
+import functools
 import time
 
 from absl import logging
@@ -8,16 +9,33 @@ from kubernetes.client.rest import ApiException
 
 from kinetic.backend.gke_client import (
   _check_pod_scheduling,
+  _core_v1,
   _load_kube_config,
   _parse_accelerator,
   _print_pod_logs,
 )
 from kinetic.backend.log_streaming import LogStreamer
 from kinetic.core import accelerators
+from kinetic.credentials import invalidate_credential_cache
+from kinetic.job_status import JobStatus
 
 LWS_GROUP = "leaderworkerset.x-k8s.io"
 LWS_VERSION = "v1"
 LWS_PLURAL = "leaderworkersets"
+
+
+@functools.lru_cache(maxsize=1)
+def _custom_api():
+  """Return a cached CustomObjectsApi client, loading kubeconfig on first call."""
+  _load_kube_config()
+  return client.CustomObjectsApi()
+
+
+@functools.lru_cache(maxsize=1)
+def _apis_api():
+  """Return a cached ApisApi client, loading kubeconfig on first call."""
+  _load_kube_config()
+  return client.ApisApi()
 
 
 def _get_job_name(job_id: str) -> str:
@@ -27,8 +45,7 @@ def _get_job_name(job_id: str) -> str:
 
 def _get_lws_version(group=LWS_GROUP):
   """Get the preferred version for the LeaderWorkerSet API."""
-  _load_kube_config()
-  api = client.ApisApi()
+  api = _apis_api()
   try:
     api_groups = api.get_api_versions().groups
     for api_group in api_groups:
@@ -53,6 +70,7 @@ def submit_pathways_job(
   job_id,
   bucket_name,
   namespace="default",
+  spot=False,
 ):
   """Submit a LeaderWorkerSet to GKE cluster.
 
@@ -68,15 +86,12 @@ def submit_pathways_job(
   Returns:
       dict: The created LeaderWorkerSet object
   """
-  _load_kube_config()
   lws_version = _get_lws_version()
 
-  accel_config = _parse_accelerator(accelerator)
+  parsed_config = accelerators.parse_accelerator(accelerator, spot=spot)
+  accel_config = _parse_accelerator(accelerator, spot=spot)
   job_name = _get_job_name(job_id)
 
-  # Extract num nodes from the TPU configuration
-
-  parsed_config = accelerators.parse_accelerator(accelerator)
   if (
     isinstance(parsed_config, accelerators.TpuConfig)
     and parsed_config.num_nodes > 1
@@ -96,7 +111,7 @@ def submit_pathways_job(
     version=lws_version,
   )
 
-  custom_api = client.CustomObjectsApi()
+  custom_api = _custom_api()
 
   try:
     created_lws = custom_api.create_namespaced_custom_object(
@@ -120,6 +135,8 @@ def submit_pathways_job(
         "official LWS installation guide."
       ) from e
     else:
+      if e.status in (401, 403):
+        invalidate_credential_cache()
       raise RuntimeError(
         f"Kubernetes API error: {e.status} - {e.reason}: {e.body}"
       ) from e
@@ -127,15 +144,14 @@ def submit_pathways_job(
 
 def wait_for_job(job_id, namespace="default", timeout=3600, poll_interval=10):
   """Wait for Pathways Job (LeaderWorkerSet) to complete."""
-  _load_kube_config()
-  core_v1 = client.CoreV1Api()
+  core_v1 = _core_v1()
 
   job_name = _get_job_name(job_id)
   start_time = time.time()
   logged_running = False
 
   # The leader pod is suffixed with '-0' by LWS
-  leader_pod_name = f"{job_name}-0"
+  leader_pod_name = _get_leader_pod_name(job_name)
 
   logged_pending = set()
   with LogStreamer(core_v1, namespace) as streamer:
@@ -208,11 +224,21 @@ def wait_for_job(job_id, namespace="default", timeout=3600, poll_interval=10):
       time.sleep(poll_interval)
 
 
-def cleanup_job(job_name, namespace="default"):
-  """Delete LeaderWorkerSet."""
-  _load_kube_config()
+def cleanup_job(
+  job_name, namespace="default", timeout: float = 180, poll_interval: float = 2
+):
+  """Delete LeaderWorkerSet.
+
+  Blocks until the API confirms the resource is gone (404).
+
+  Args:
+      job_name: Name of the LeaderWorkerSet
+      namespace: Kubernetes namespace
+      timeout: Maximum seconds to wait for deletion (default 180)
+      poll_interval: Seconds between existence checks (default 2)
+  """
   lws_version = _get_lws_version()
-  custom_api = client.CustomObjectsApi()
+  custom_api = _custom_api()
 
   try:
     custom_api.delete_namespaced_custom_object(
@@ -226,13 +252,150 @@ def cleanup_job(job_name, namespace="default"):
   except ApiException as e:
     if e.status == 404:
       # Job already deleted
-      pass
+      return
     else:
       logging.warning(
         "Failed to delete LeaderWorkerSet %s: %s",
         job_name,
         e.reason,
       )
+      return
+
+  # Deletion is async; poll until the resource is gone.
+  max_attempts = max(1, timeout // poll_interval)
+  for _ in range(max_attempts):
+    if not job_exists(job_name, namespace):
+      return
+    time.sleep(poll_interval)
+  logging.warning(
+    "Timed out waiting for LeaderWorkerSet %s to be deleted", job_name
+  )
+
+
+def job_exists(job_name, namespace="default") -> bool:
+  """Return whether a namespaced LeaderWorkerSet currently exists."""
+  lws_version = _get_lws_version()
+  custom_api = _custom_api()
+  try:
+    custom_api.get_namespaced_custom_object(
+      group=LWS_GROUP,
+      version=lws_version,
+      namespace=namespace,
+      plural=LWS_PLURAL,
+      name=job_name,
+    )
+    return True
+  except ApiException as e:
+    if e.status == 404:
+      return False
+    raise RuntimeError(
+      f"Failed to read LeaderWorkerSet {job_name}: {e.reason}"
+    ) from e
+
+
+def get_job_status(job_name, namespace="default") -> JobStatus:
+  """Return the current Pathways job status for async observation APIs."""
+  core_v1 = _core_v1()
+  leader_pod_name = _get_leader_pod_name(job_name)
+
+  try:
+    pod = core_v1.read_namespaced_pod(leader_pod_name, namespace)
+  except ApiException as e:
+    if e.status == 404:
+      return (
+        JobStatus.PENDING
+        if job_exists(job_name, namespace)
+        else JobStatus.NOT_FOUND
+      )
+    raise RuntimeError(f"Failed to read leader pod status: {e.reason}") from e
+
+  if pod.status.phase == "Succeeded":
+    return JobStatus.SUCCEEDED
+  if pod.status.phase == "Failed":
+    return JobStatus.FAILED
+  if pod.status.container_statuses:
+    container_status = pod.status.container_statuses[0]
+    if container_status.state.terminated:
+      return (
+        JobStatus.SUCCEEDED
+        if container_status.state.terminated.exit_code == 0
+        else JobStatus.FAILED
+      )
+    if container_status.last_state.terminated:
+      return (
+        JobStatus.SUCCEEDED
+        if container_status.last_state.terminated.exit_code == 0
+        else JobStatus.FAILED
+      )
+  if pod.status.phase == "Running":
+    return JobStatus.RUNNING
+  return JobStatus.PENDING
+
+
+def get_job_logs(
+  job_name, namespace="default", tail_lines: int | None = None
+) -> str:
+  """Return logs for the leader pod of a Pathways job."""
+  core_v1 = _core_v1()
+  leader_pod_name = _get_leader_pod_name(job_name)
+
+  log_kwargs = {}
+  if tail_lines is not None:
+    log_kwargs["tail_lines"] = tail_lines
+  try:
+    return core_v1.read_namespaced_pod_log(
+      leader_pod_name,
+      namespace,
+      **log_kwargs,
+    )
+  except ApiException as e:
+    if e.status == 404:
+      raise RuntimeError(
+        f"No leader pod found for Pathways job {job_name}"
+      ) from e
+    raise RuntimeError(f"Failed to read leader pod logs: {e.reason}") from e
+
+
+def get_job_pod_name(job_name, namespace="default") -> str | None:
+  """Return the leader pod name for a Pathways job if it exists."""
+  core_v1 = _core_v1()
+  leader_pod_name = _get_leader_pod_name(job_name)
+  try:
+    core_v1.read_namespaced_pod(leader_pod_name, namespace)
+  except ApiException as e:
+    if e.status == 404:
+      return None
+    raise RuntimeError(f"Failed to read leader pod status: {e.reason}") from e
+  return leader_pod_name
+
+
+def list_jobs(namespace="default") -> list[dict[str, str]]:
+  """List live Pathways jobs managed by Kinetic in a namespace."""
+  lws_version = _get_lws_version()
+  custom_api = _custom_api()
+  objects = custom_api.list_namespaced_custom_object(
+    group=LWS_GROUP,
+    version=lws_version,
+    namespace=namespace,
+    plural=LWS_PLURAL,
+    label_selector="app=kinetic-pathways",
+  )
+
+  results = []
+  for item in objects.get("items", []):
+    metadata = item.get("metadata", {})
+    labels = metadata.get("labels", {})
+    job_id = labels.get("job-id")
+    name = metadata.get("name")
+    if job_id is None or name is None:
+      continue
+    results.append(
+      {
+        "job_id": job_id,
+        "k8s_name": name,
+      }
+    )
+  return results
 
 
 def _create_lws_spec(
@@ -263,10 +426,12 @@ def _create_lws_spec(
     {"name": "TPU_WORKER_ID", "value": "$(LWS_WORKER_INDEX)"},
   ]
 
-  tolerations = [
-    {"key": t["key"], "operator": t["operator"], "effect": t["effect"]}
-    for t in accel_config["tolerations"]
-  ]
+  tolerations = []
+  for t in accel_config["tolerations"]:
+    entry = {"key": t["key"], "operator": t["operator"], "effect": t["effect"]}
+    if "value" in t:
+      entry["value"] = t["value"]
+    tolerations.append(entry)
 
   pod_template = {
     "metadata": {
@@ -289,8 +454,12 @@ def _create_lws_spec(
           ],
           "env": env_vars,
           "resources": {
-            "limits": accel_config["resource_limits"],
-            "requests": accel_config["resource_requests"],
+            "limits": {
+              k: str(v) for k, v in accel_config["resource_limits"].items()
+            },
+            "requests": {
+              k: str(v) for k, v in accel_config["resource_requests"].items()
+            },
           },
         }
       ],
@@ -309,7 +478,7 @@ def _create_lws_spec(
     "metadata": {
       "name": job_name,
       "namespace": namespace,
-      "labels": {"app": "kinetic-pathways"},
+      "labels": {"app": "kinetic-pathways", "job-id": job_id},
     },
     "spec": {
       "replicas": 1,
@@ -321,3 +490,8 @@ def _create_lws_spec(
       },
     },
   }
+
+
+def _get_leader_pod_name(job_name: str) -> str:
+  """Get the leader pod name for a LeaderWorkerSet."""
+  return f"{job_name}-0"

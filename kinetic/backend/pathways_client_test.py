@@ -13,18 +13,21 @@ from kinetic.backend.pathways_client import (
   _create_lws_spec,
   _get_lws_version,
   cleanup_job,
+  get_job_logs,
+  get_job_status,
+  job_exists,
   submit_pathways_job,
   wait_for_job,
 )
+from kinetic.backend.pathways_client import (
+  list_jobs as list_pathways_jobs,
+)
+from kinetic.job_status import JobStatus
 
 _MODULE = "kinetic.backend.pathways_client"
 
 
 class TestGetLwsVersion(absltest.TestCase):
-  def setUp(self):
-    super().setUp()
-    self.enterContext(mock.patch(f"{_MODULE}._load_kube_config"))
-
   def test_returns_preferred_version(self):
     """Test that if the LWS API group is found, we return its preferred version."""
     mock_api = MagicMock()
@@ -33,7 +36,7 @@ class TestGetLwsVersion(absltest.TestCase):
     group.preferred_version.version = "v2"
     mock_api.get_api_versions.return_value.groups = [group]
 
-    with mock.patch(f"{_MODULE}.client.ApisApi", return_value=mock_api):
+    with mock.patch(f"{_MODULE}._apis_api", return_value=mock_api):
       self.assertEqual(_get_lws_version(), "v2")
 
   def test_group_not_found_falls_back(self):
@@ -43,7 +46,7 @@ class TestGetLwsVersion(absltest.TestCase):
     other_group.name = "other.group.io"
     mock_api.get_api_versions.return_value.groups = [other_group]
 
-    with mock.patch(f"{_MODULE}.client.ApisApi", return_value=mock_api):
+    with mock.patch(f"{_MODULE}._apis_api", return_value=mock_api):
       self.assertEqual(_get_lws_version(), LWS_VERSION)
 
   def test_api_exception_falls_back(self):
@@ -53,7 +56,7 @@ class TestGetLwsVersion(absltest.TestCase):
       status=500, reason="Server Error"
     )
 
-    with mock.patch(f"{_MODULE}.client.ApisApi", return_value=mock_api):
+    with mock.patch(f"{_MODULE}._apis_api", return_value=mock_api):
       self.assertEqual(_get_lws_version(), LWS_VERSION)
 
 
@@ -101,6 +104,7 @@ class TestCreateLwsSpec(absltest.TestCase):
     self.assertEqual(spec["metadata"]["name"], "keras-pathways-abc")
     self.assertEqual(spec["metadata"]["namespace"], "default")
     self.assertEqual(spec["metadata"]["labels"]["app"], "kinetic-pathways")
+    self.assertEqual(spec["metadata"]["labels"]["job-id"], "j1")
     # Replicas and size.
     self.assertEqual(spec["spec"]["replicas"], 1)
     self.assertEqual(spec["spec"]["leaderWorkerTemplate"]["size"], 4)
@@ -142,6 +146,33 @@ class TestCreateLwsSpec(absltest.TestCase):
     )
     self.assertEqual(env["MEGASCALE_NUM_SLICES"], "4")
     self.assertEqual(env["TPU_WORKER_ID"], "$(LWS_WORKER_INDEX)")
+
+  def test_spot_spec(self):
+    """Test that spot selectors and tolerations are added when present."""
+    accel_config = self._make_tpu_accel_config()
+    accel_config["node_selector"]["cloud.google.com/gke-spot"] = "true"
+    accel_config["tolerations"].append(
+      {
+        "key": "cloud.google.com/gke-spot",
+        "operator": "Equal",
+        "value": "true",
+        "effect": "NoSchedule",
+      }
+    )
+
+    spec = self._make_spec(accel_config=accel_config)
+    pod_spec = spec["spec"]["leaderWorkerTemplate"]["leaderTemplate"]["spec"]
+
+    self.assertEqual(
+      pod_spec["nodeSelector"]["cloud.google.com/gke-spot"], "true"
+    )
+    spot_tol = [
+      t
+      for t in pod_spec["tolerations"]
+      if t.get("key") == "cloud.google.com/gke-spot"
+    ]
+    self.assertLen(spot_tol, 1)
+    self.assertEqual(spot_tol[0]["value"], "true")
 
   def test_tpu_accel_config(self):
     """Test resources, tolerations, and node selector for TPU config."""
@@ -207,12 +238,11 @@ class TestCreateLwsSpec(absltest.TestCase):
 class TestSubmitPathwaysJob(absltest.TestCase):
   def setUp(self):
     super().setUp()
-    self.enterContext(mock.patch(f"{_MODULE}._load_kube_config"))
     self.enterContext(
       mock.patch(f"{_MODULE}._get_lws_version", return_value="v1")
     )
     self.mock_custom_api = self.enterContext(
-      mock.patch(f"{_MODULE}.client.CustomObjectsApi")
+      mock.patch(f"{_MODULE}._custom_api")
     ).return_value
 
   def _call(self, **overrides):
@@ -258,7 +288,6 @@ class TestSubmitPathwaysJob(absltest.TestCase):
 class TestWaitForJob(absltest.TestCase):
   def setUp(self):
     super().setUp()
-    self.enterContext(mock.patch(f"{_MODULE}._load_kube_config"))
     self.mock_print_pod_logs = self.enterContext(
       mock.patch(f"{_MODULE}._print_pod_logs")
     )
@@ -270,7 +299,7 @@ class TestWaitForJob(absltest.TestCase):
       mock.patch(f"{_MODULE}.time.time", return_value=0)
     )
     self.mock_core = self.enterContext(
-      mock.patch(f"{_MODULE}.client.CoreV1Api")
+      mock.patch(f"{_MODULE}._core_v1")
     ).return_value
 
     self.mock_streamer = MagicMock()
@@ -415,13 +444,13 @@ class TestWaitForJob(absltest.TestCase):
 class TestCleanupJob(absltest.TestCase):
   def setUp(self):
     super().setUp()
-    self.enterContext(mock.patch(f"{_MODULE}._load_kube_config"))
     self.enterContext(
       mock.patch(f"{_MODULE}._get_lws_version", return_value="v1")
     )
     self.mock_custom_api = self.enterContext(
-      mock.patch(f"{_MODULE}.client.CustomObjectsApi")
+      mock.patch(f"{_MODULE}._custom_api")
     ).return_value
+    self.enterContext(mock.patch(f"{_MODULE}.job_exists", return_value=False))
 
   def test_deletes_lws(self):
     cleanup_job("my-job")
@@ -444,6 +473,193 @@ class TestCleanupJob(absltest.TestCase):
       ApiException(status=500, reason="Server Error")
     )
     cleanup_job("my-job")  # should not raise
+
+
+class TestAsyncObservationHelpers(absltest.TestCase):
+  def setUp(self):
+    super().setUp()
+    self.enterContext(
+      mock.patch(f"{_MODULE}._get_lws_version", return_value="v1")
+    )
+    self.mock_core = self.enterContext(
+      mock.patch(f"{_MODULE}._core_v1")
+    ).return_value
+    self.mock_custom_api = self.enterContext(
+      mock.patch(f"{_MODULE}._custom_api")
+    ).return_value
+
+  def _make_pod(self, phase, exit_code=None):
+    pod = MagicMock()
+    pod.status.phase = phase
+    if exit_code is None:
+      pod.status.container_statuses = None
+    else:
+      container_status = MagicMock()
+      container_status.state.terminated = MagicMock(exit_code=exit_code)
+      container_status.last_state.terminated = None
+      pod.status.container_statuses = [container_status]
+    return pod
+
+  def test_get_job_status_running(self):
+    self.mock_core.read_namespaced_pod.return_value = self._make_pod("Running")
+
+    status = get_job_status("keras-pathways-job-1")
+
+    self.assertEqual(status, JobStatus.RUNNING)
+
+  def test_get_job_status_succeeded_from_phase(self):
+    self.mock_core.read_namespaced_pod.return_value = self._make_pod(
+      "Succeeded"
+    )
+
+    status = get_job_status("keras-pathways-job-1")
+
+    self.assertEqual(status, JobStatus.SUCCEEDED)
+
+  def test_get_job_status_failed_from_terminated_container(self):
+    self.mock_core.read_namespaced_pod.return_value = self._make_pod(
+      "Running", exit_code=7
+    )
+
+    status = get_job_status("keras-pathways-job-1")
+
+    self.assertEqual(status, JobStatus.FAILED)
+
+  def test_get_job_status_pending_when_lws_exists_but_pod_missing(self):
+    self.mock_core.read_namespaced_pod.side_effect = ApiException(
+      status=404, reason="Not Found"
+    )
+    self.mock_custom_api.get_namespaced_custom_object.return_value = {"ok": 1}
+
+    status = get_job_status("keras-pathways-job-1")
+
+    self.assertEqual(status, JobStatus.PENDING)
+
+  def test_get_job_status_not_found_when_lws_missing(self):
+    self.mock_core.read_namespaced_pod.side_effect = ApiException(
+      status=404, reason="Not Found"
+    )
+    self.mock_custom_api.get_namespaced_custom_object.side_effect = (
+      ApiException(status=404, reason="Not Found")
+    )
+
+    status = get_job_status("keras-pathways-job-1")
+
+    self.assertEqual(status, JobStatus.NOT_FOUND)
+
+  def test_get_job_status_failed_from_phase(self):
+    self.mock_core.read_namespaced_pod.return_value = self._make_pod("Failed")
+
+    status = get_job_status("keras-pathways-job-1")
+
+    self.assertEqual(status, JobStatus.FAILED)
+
+  def test_get_job_status_succeeded_from_terminated_container(self):
+    self.mock_core.read_namespaced_pod.return_value = self._make_pod(
+      "Running", exit_code=0
+    )
+
+    status = get_job_status("keras-pathways-job-1")
+
+    self.assertEqual(status, JobStatus.SUCCEEDED)
+
+  def test_get_job_status_failed_from_last_state(self):
+    pod = MagicMock()
+    pod.status.phase = "Running"
+    container_status = MagicMock()
+    container_status.state.terminated = None
+    container_status.last_state.terminated = MagicMock(exit_code=1)
+    pod.status.container_statuses = [container_status]
+    self.mock_core.read_namespaced_pod.return_value = pod
+
+    status = get_job_status("keras-pathways-job-1")
+
+    self.assertEqual(status, JobStatus.FAILED)
+
+  def test_get_job_status_succeeded_from_last_state(self):
+    pod = MagicMock()
+    pod.status.phase = "Running"
+    container_status = MagicMock()
+    container_status.state.terminated = None
+    container_status.last_state.terminated = MagicMock(exit_code=0)
+    pod.status.container_statuses = [container_status]
+    self.mock_core.read_namespaced_pod.return_value = pod
+
+    status = get_job_status("keras-pathways-job-1")
+
+    self.assertEqual(status, JobStatus.SUCCEEDED)
+
+  def test_get_job_status_api_error_raises(self):
+    self.mock_core.read_namespaced_pod.side_effect = ApiException(
+      status=500, reason="Internal Server Error"
+    )
+
+    with self.assertRaisesRegex(RuntimeError, "Failed to read leader pod"):
+      get_job_status("keras-pathways-job-1")
+
+  def test_get_job_logs_reads_leader_pod(self):
+    self.mock_core.read_namespaced_pod_log.return_value = "log output"
+
+    logs = get_job_logs("keras-pathways-job-1", tail_lines=25)
+
+    self.assertEqual(logs, "log output")
+    self.mock_core.read_namespaced_pod_log.assert_called_once_with(
+      "keras-pathways-job-1-0",
+      "default",
+      tail_lines=25,
+    )
+
+  def test_get_job_logs_missing_leader_raises(self):
+    self.mock_core.read_namespaced_pod_log.side_effect = ApiException(
+      status=404, reason="Not Found"
+    )
+
+    with self.assertRaisesRegex(RuntimeError, "No leader pod found"):
+      get_job_logs("keras-pathways-job-1")
+
+  def test_job_exists_true(self):
+    self.mock_custom_api.get_namespaced_custom_object.return_value = {"ok": 1}
+
+    self.assertTrue(job_exists("keras-pathways-job-1"))
+
+  def test_job_exists_false_for_404(self):
+    self.mock_custom_api.get_namespaced_custom_object.side_effect = (
+      ApiException(status=404, reason="Not Found")
+    )
+
+    self.assertFalse(job_exists("keras-pathways-job-1"))
+
+  def test_list_jobs_returns_labelled_objects(self):
+    self.mock_custom_api.list_namespaced_custom_object.return_value = {
+      "items": [
+        {
+          "metadata": {
+            "name": "keras-pathways-job-1",
+            "labels": {"job-id": "job-1"},
+          }
+        },
+        {
+          "metadata": {
+            "name": "ignored",
+            "labels": {},
+          }
+        },
+      ]
+    }
+
+    jobs = list_pathways_jobs("team-ns")
+
+    self.assertEqual(
+      jobs,
+      [{"job_id": "job-1", "k8s_name": "keras-pathways-job-1"}],
+    )
+    self.mock_custom_api.list_namespaced_custom_object.assert_called_once_with(
+      group=LWS_GROUP,
+      version="v1",
+      namespace="team-ns",
+      plural=LWS_PLURAL,
+      label_selector="app=kinetic-pathways",
+    )
 
 
 if __name__ == "__main__":

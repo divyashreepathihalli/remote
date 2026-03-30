@@ -2,15 +2,30 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
+import threading
 
 from absl import logging
+from google.cloud import exceptions as cloud_exceptions
 from google.cloud import storage
 from google.cloud.storage import transfer_manager
+from google.cloud.storage.retry import DEFAULT_RETRY
 
+from kinetic.constants import get_default_project
 from kinetic.data import Data
-from kinetic.infra.infra import get_default_project
+
+_cached_clients: dict[str | None, storage.Client] = {}
+_client_lock = threading.Lock()
+
+
+def _get_client(project: str | None) -> storage.Client:
+  """Return a cached storage client for the given project."""
+  with _client_lock:
+    if project not in _cached_clients:
+      _cached_clients[project] = storage.Client(project=project)
+    return _cached_clients[project]
 
 
 def upload_artifacts(
@@ -31,19 +46,19 @@ def upload_artifacts(
   """
   project = project or get_default_project()
 
-  client = storage.Client(project=project)
+  client = _get_client(project)
   bucket = client.bucket(bucket_name)
 
   # Upload payload
   blob = bucket.blob(f"{job_id}/payload.pkl")
-  blob.upload_from_filename(payload_path)
+  blob.upload_from_filename(payload_path, retry=DEFAULT_RETRY)
   logging.info(
     "Uploaded payload to gs://%s/%s/payload.pkl", bucket_name, job_id
   )
 
   # Upload context
   blob = bucket.blob(f"{job_id}/context.zip")
-  blob.upload_from_filename(context_path)
+  blob.upload_from_filename(context_path, retry=DEFAULT_RETRY)
   logging.info(
     "Uploaded context to gs://%s/%s/context.zip", bucket_name, job_id
   )
@@ -72,7 +87,7 @@ def download_result(
       Local path to downloaded result file
   """
   project = project or get_default_project()
-  client = storage.Client(project=project)
+  client = _get_client(project)
   bucket = client.bucket(bucket_name)
 
   blob = bucket.blob(f"{job_id}/result.pkl")
@@ -83,6 +98,42 @@ def download_result(
   )
 
   return local_path
+
+
+def upload_handle(
+  bucket_name: str,
+  job_id: str,
+  handle_payload: dict[str, str],
+  project: str | None = None,
+) -> None:
+  """Upload a job handle to Cloud Storage as JSON."""
+  project = project or get_default_project()
+  client = _get_client(project)
+  bucket = client.bucket(bucket_name)
+
+  blob = bucket.blob(f"{job_id}/handle.json")
+  blob.upload_from_string(
+    json.dumps(handle_payload, sort_keys=True),
+    content_type="application/json",
+    retry=DEFAULT_RETRY,
+  )
+  logging.info("Uploaded handle to gs://%s/%s/handle.json", bucket_name, job_id)
+
+
+def download_handle(
+  bucket_name: str, job_id: str, project: str | None = None
+) -> dict[str, str]:
+  """Download and deserialize a job handle from Cloud Storage."""
+  project = project or get_default_project()
+  client = _get_client(project)
+  bucket = client.bucket(bucket_name)
+
+  blob = bucket.blob(f"{job_id}/handle.json")
+  handle_text = blob.download_as_text()
+  logging.info(
+    "Downloaded handle from gs://%s/%s/handle.json", bucket_name, job_id
+  )
+  return json.loads(handle_text)
 
 
 def cleanup_artifacts(
@@ -96,23 +147,30 @@ def cleanup_artifacts(
       project: GCP project ID (optional, uses env vars if not provided)
   """
   project = project or get_default_project()
-  client = storage.Client(project=project)
+  client = _get_client(project)
   bucket = client.bucket(bucket_name)
 
   # Delete all blobs with job_id prefix
-  blobs = bucket.list_blobs(prefix=f"{job_id}/")
-  deleted_count = 0
-  for blob in blobs:
-    blob.delete()
-    deleted_count += 1
+  blobs = list(bucket.list_blobs(prefix=f"{job_id}/"))
 
-  if deleted_count > 0:
-    logging.info(
-      "Cleaned up %d artifacts from gs://%s/%s/",
-      deleted_count,
+  if not blobs:
+    return
+
+  try:
+    bucket.delete_blobs(blobs, retry=DEFAULT_RETRY)
+  except cloud_exceptions.NotFound:
+    logging.warning(
+      "Some artifacts could not be deleted from gs://%s/%s/, continuing anyway",
       bucket_name,
       job_id,
+      exc_info=True,
     )
+  logging.info(
+    "Cleaned up %d artifacts from gs://%s/%s/",
+    len(blobs),
+    bucket_name,
+    job_id,
+  )
 
 
 def upload_data(
@@ -144,7 +202,7 @@ def upload_data(
   cache_prefix = f"{namespace_prefix}/data-cache/{content_hash}"
 
   project = project or get_default_project()
-  client = storage.Client(project=project)
+  client = _get_client(project)
   bucket = client.bucket(bucket_name)
 
   # O(1) cache hit check via sentinel blob
@@ -183,10 +241,10 @@ def upload_data(
   else:
     filename = os.path.basename(data.path)
     blob = bucket.blob(f"{cache_prefix}/{filename}")
-    blob.upload_from_filename(data.path)
+    blob.upload_from_filename(data.path, retry=DEFAULT_RETRY)
 
   # Write sentinel last — signals upload-complete
-  marker_blob.upload_from_string("")
+  marker_blob.upload_from_string("", retry=DEFAULT_RETRY)
   logging.info("Data uploaded to gs://%s/%s/", bucket_name, cache_prefix)
   return f"gs://{bucket_name}/{cache_prefix}"
 

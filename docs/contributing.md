@@ -1,4 +1,4 @@
-# How to contribute
+# Contributing
 
 We'd love to accept your patches and contributions to this project.
 
@@ -30,7 +30,7 @@ This project follows
 1. Install the package with development dependencies:
 
    ```bash
-   pip install -e ".[dev]"
+   uv pip install -e ".[dev]"
    ```
 
 2. Install pre-commit hooks:
@@ -56,30 +56,30 @@ Before submitting a pull request, please ensure your changes pass linting and un
 - **E2E tests:** End-to-end tests run real workloads against a GKE cluster. They live in `tests/e2e/` and are skipped by default unless explicitly enabled.
 
   **Prerequisites:**
-  - A GCP project with a provisioned GKE cluster (see [Quick Start](../README.md#quick-start))
+  - A GCP project with a provisioned GKE cluster.
   - Google Cloud SDK authenticated (`gcloud auth login` and `gcloud auth application-default login`)
-  - GKE credentials configured: `gcloud container clusters get-credentials <KERAS_REMOTE_CLUSTER> --zone <KERAS_REMOTE_ZONE> --project <KERAS_REMOTE_PROJECT>`
-  - Test dependencies installed: `pip install -e ".[test,cli]"`
+  - GKE credentials configured: `gcloud container clusters get-credentials <KINETIC_CLUSTER> --zone <KINETIC_ZONE> --project <KINETIC_PROJECT>`
+  - Test dependencies installed: `uv pip install -e ".[test,cli]"`
 
   **Required environment variables:**
 
-  | Variable               | Required | Default         | Description                    |
-  | ---------------------- | -------- | --------------- | ------------------------------ |
-  | `E2E_TESTS`            | Yes      | —               | Set to `1` to enable e2e tests |
-  | `KERAS_REMOTE_PROJECT` | Yes      | —               | Google Cloud project ID        |
-  | `KERAS_REMOTE_ZONE`    | No       | `us-central1-a` | GKE cluster zone               |
-  | `KERAS_REMOTE_CLUSTER` | No       | `kinetic`  | GKE cluster name               |
+  | Variable          | Required | Default         | Description                    |
+  | ----------------- | -------- | --------------- | ------------------------------ |
+  | `E2E_TESTS`       | Yes      | —               | Set to `1` to enable e2e tests |
+  | `KINETIC_PROJECT` | Yes      | —               | Google Cloud project ID        |
+  | `KINETIC_ZONE`    | No       | `us-central1-a` | GKE cluster zone               |
+| `KINETIC_CLUSTER` | No       | `kinetic-cluster` | GKE cluster name               |
 
   **Run all e2e tests:**
 
   ```bash
-  E2E_TESTS=1 KERAS_REMOTE_PROJECT=my-project python -m pytest tests/e2e/ -v -n auto
+  E2E_TESTS=1 KINETIC_PROJECT=my-project python -m pytest tests/e2e/ -v -n auto
   ```
 
   **Run a specific test file:**
 
   ```bash
-  E2E_TESTS=1 KERAS_REMOTE_PROJECT=my-project python -m pytest tests/e2e/cpu_execution_test.py -v
+  E2E_TESTS=1 KINETIC_PROJECT=my-project python -m pytest tests/e2e/cpu_execution_test.py -v
   ```
 
   Drop `-n auto` to run tests serially to make it easier to debug.
@@ -98,3 +98,13 @@ All submissions, including submissions by project members, require review. We
 use GitHub pull requests for this purpose. Consult
 [GitHub Help](https://help.github.com/articles/about-pull-requests/) for more
 information on using pull requests.
+
+## Documentation Contribution Process
+
+```sh
+# Install docs libraries:
+pip install .[docs]
+
+# Build and serve docs locally:
+sphinx-autobuild docs /tmp/docs
+```

@@ -72,7 +72,7 @@ def create_program(config):
     # 2. Artifact Registry docker repository
     repo = gcp.artifactregistry.Repository(
       "kinetic-repo",
-      repository_id=f"kr-{cluster_name}",
+      repository_id=f"kn-{cluster_name}",
       location=ar_location,
       format="DOCKER",
       description="kinetic container images",
@@ -85,7 +85,7 @@ def create_program(config):
 
     gcp.storage.Bucket(
       "kinetic-jobs-bucket",
-      name=f"{project_id}-kr-{cluster_name}-jobs",
+      name=f"{project_id}-kn-{cluster_name}-jobs",
       location=region,
       project=project_id,
       force_destroy=True,
@@ -94,7 +94,7 @@ def create_program(config):
 
     gcp.storage.Bucket(
       "kinetic-builds-bucket",
-      name=f"{project_id}-kr-{cluster_name}-builds",
+      name=f"{project_id}-kn-{cluster_name}-builds",
       location=ar_location,
       project=project_id,
       force_destroy=True,
@@ -171,7 +171,7 @@ def create_program(config):
     pulumi.export(
       "ar_registry",
       repo.name.apply(
-        lambda _: f"{ar_location}-docker.pkg.dev/{project_id}/kr-{cluster_name}"
+        lambda _: f"{ar_location}-docker.pkg.dev/{project_id}/kn-{cluster_name}"
       ),
     )
 
@@ -242,6 +242,7 @@ def _create_gpu_node_pool(
       ],
       labels={RESOURCE_NAME_PREFIX: "true"},
       max_run_duration=f"{NODE_MAX_RUN_DURATION_SECONDS}s",  # 24 hours
+      spot=gpu.spot,
     ),
   )
 
@@ -286,7 +287,10 @@ def _create_tpu_node_pool(
       machine_type=tpu.machine_type,
       oauth_scopes=_BASE_OAUTH_SCOPES,
       labels={RESOURCE_NAME_PREFIX: "true"},
-      max_run_duration=f"{NODE_MAX_RUN_DURATION_SECONDS}s",  # 24 hours
+      max_run_duration=None
+      if tpu.spot
+      else f"{NODE_MAX_RUN_DURATION_SECONDS}s",  # 24 hours
+      spot=tpu.spot,
     ),
     placement_policy=placement,
   )

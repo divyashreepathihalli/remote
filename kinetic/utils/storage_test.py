@@ -1,5 +1,6 @@
 """Tests for kinetic.utils.storage — Cloud Storage operations."""
 
+import json
 import os
 import pathlib
 import tempfile
@@ -8,15 +9,19 @@ from unittest.mock import MagicMock
 
 from absl.testing import absltest, parameterized
 
+from kinetic.constants import get_default_project
 from kinetic.data import Data
-from kinetic.infra.infra import get_default_project
+from kinetic.utils import storage as storage_module
 from kinetic.utils.storage import (
+  DEFAULT_RETRY,
   _compute_total_size,
   _upload_directory,
   cleanup_artifacts,
+  download_handle,
   download_result,
   upload_artifacts,
   upload_data,
+  upload_handle,
 )
 
 
@@ -32,6 +37,7 @@ class _GcsTestBase(absltest.TestCase):
 
   def setUp(self):
     super().setUp()
+    storage_module._cached_clients.clear()
     self.mock_gcs = self.enterContext(
       mock.patch(
         "kinetic.utils.storage.storage.Client",
@@ -82,6 +88,36 @@ class TestDownloadResult(_GcsTestBase):
     self.assertIn("result-job-xyz.pkl", result)
 
 
+class TestHandleStorage(_GcsTestBase):
+  def test_upload_handle_writes_json_blob(self):
+    mock_bucket = self.mock_gcs.bucket.return_value
+    mock_blob = mock_bucket.blob.return_value
+    handle = {"job_id": "job-abc", "backend": "gke"}
+
+    upload_handle("my-bucket", "job-abc", handle, project="proj")
+
+    mock_bucket.blob.assert_called_once_with("job-abc/handle.json")
+    payload = mock_blob.upload_from_string.call_args[0][0]
+    self.assertEqual(json.loads(payload), handle)
+    self.assertEqual(
+      mock_blob.upload_from_string.call_args.kwargs["content_type"],
+      "application/json",
+    )
+
+  def test_download_handle_reads_json_blob(self):
+    mock_bucket = self.mock_gcs.bucket.return_value
+    mock_blob = mock_bucket.blob.return_value
+    mock_blob.download_as_text.return_value = json.dumps(
+      {"job_id": "job-xyz", "backend": "pathways"}
+    )
+
+    handle = download_handle("my-bucket", "job-xyz", project="proj")
+
+    mock_bucket.blob.assert_called_once_with("job-xyz/handle.json")
+    self.assertEqual(handle["job_id"], "job-xyz")
+    self.assertEqual(handle["backend"], "pathways")
+
+
 class TestCleanupArtifacts(_GcsTestBase):
   def test_deletes_all_blobs(self):
     mock_bucket = self.mock_gcs.bucket.return_value
@@ -93,9 +129,9 @@ class TestCleanupArtifacts(_GcsTestBase):
     cleanup_artifacts("my-bucket", "job-abc", project="proj")
 
     mock_bucket.list_blobs.assert_called_once_with(prefix="job-abc/")
-    blob1.delete.assert_called_once()
-    blob2.delete.assert_called_once()
-    blob3.delete.assert_called_once()
+    mock_bucket.delete_blobs.assert_called_once_with(
+      [blob1, blob2, blob3], retry=DEFAULT_RETRY
+    )
 
   def test_no_blobs_no_error(self):
     mock_bucket = self.mock_gcs.bucket.return_value
@@ -110,33 +146,33 @@ class TestGetProject(parameterized.TestCase):
   @parameterized.named_parameters(
     dict(
       testcase_name="kinetic_project_only",
-      kr_project="kr-proj",
+      kn_project="kn-proj",
       gc_project=None,
-      expected="kr-proj",
+      expected="kn-proj",
     ),
     dict(
       testcase_name="google_cloud_project_fallback",
-      kr_project=None,
+      kn_project=None,
       gc_project="gc-proj",
       expected="gc-proj",
     ),
     dict(
       testcase_name="neither_set",
-      kr_project=None,
+      kn_project=None,
       gc_project=None,
       expected=None,
     ),
     dict(
       testcase_name="kinetic_takes_precedence",
-      kr_project="kr-proj",
+      kn_project="kn-proj",
       gc_project="gc-proj",
-      expected="kr-proj",
+      expected="kn-proj",
     ),
   )
-  def test_resolves_project(self, kr_project, gc_project, expected):
+  def test_resolves_project(self, kn_project, gc_project, expected):
     env = {}
-    if kr_project:
-      env["KERAS_REMOTE_PROJECT"] = kr_project
+    if kn_project:
+      env["KINETIC_PROJECT"] = kn_project
     if gc_project:
       env["GOOGLE_CLOUD_PROJECT"] = gc_project
     with mock.patch.dict(os.environ, env, clear=True):
@@ -200,7 +236,9 @@ class TestUploadData(_GcsTestBase):
     # Marker written last
     marker_name = f"{expected_prefix}/.cache_marker"
     self.assertIn(marker_name, blobs)
-    blobs[marker_name].upload_from_string.assert_called_once_with("")
+    blobs[marker_name].upload_from_string.assert_called_once_with(
+      "", retry=mock.ANY
+    )
 
   @mock.patch(
     "kinetic.utils.storage.transfer_manager.upload_many_from_filenames",
@@ -228,7 +266,7 @@ class TestUploadData(_GcsTestBase):
     filenames = sorted(mock_upload.call_args[0][1])
     self.assertEqual(filenames, ["train.csv", "val.csv"])
     # Marker written after upload
-    marker_blob.upload_from_string.assert_called_once_with("")
+    marker_blob.upload_from_string.assert_called_once_with("", retry=mock.ANY)
 
   def test_custom_namespace(self):
     tmp = _make_temp_path(self)

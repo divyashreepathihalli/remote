@@ -13,6 +13,8 @@ from kubernetes.client.rest import ApiException
 from kinetic.backend.log_streaming import LogStreamer
 from kinetic.core import accelerators
 from kinetic.core.accelerators import TpuConfig
+from kinetic.credentials import invalidate_credential_cache
+from kinetic.job_status import JobStatus
 
 
 def submit_k8s_job(
@@ -23,6 +25,7 @@ def submit_k8s_job(
   job_id,
   bucket_name,
   namespace="default",
+  spot=False,
 ):
   """Submit a Kubernetes Job to GKE cluster.
 
@@ -38,11 +41,8 @@ def submit_k8s_job(
   Returns:
       kubernetes.client.V1Job object
   """
-  # Load kubeconfig
-  _load_kube_config()
-
   # Parse accelerator configuration
-  accel_config = _parse_accelerator(accelerator)
+  accel_config = _parse_accelerator(accelerator, spot=spot)
 
   # Create job specification
   job_name = f"kinetic-{job_id}"
@@ -56,7 +56,7 @@ def submit_k8s_job(
   )
 
   # Submit job
-  batch_v1 = client.BatchV1Api()
+  batch_v1 = _batch_v1()
 
   try:
     created_job = batch_v1.create_namespaced_job(namespace=namespace, body=job)
@@ -67,7 +67,8 @@ def submit_k8s_job(
     )
     return created_job
   except ApiException as e:
-    if e.status == 403:
+    if e.status in (401, 403):
+      invalidate_credential_cache()
       raise RuntimeError(
         f"Permission denied creating K8s Job. Ensure your kubeconfig "
         f"has 'create' permission for Jobs in namespace '{namespace}'. "
@@ -104,9 +105,8 @@ def wait_for_job(job, namespace="default", timeout=3600, poll_interval=10):
   Raises:
       RuntimeError: If job fails or times out
   """
-  _load_kube_config()
-  batch_v1 = client.BatchV1Api()
-  core_v1 = client.CoreV1Api()
+  batch_v1 = _batch_v1()
+  core_v1 = _core_v1()
 
   job_name = job.metadata.name
   start_time = time.time()
@@ -157,15 +157,20 @@ def wait_for_job(job, namespace="default", timeout=3600, poll_interval=10):
       time.sleep(poll_interval)
 
 
-def cleanup_job(job_name, namespace="default"):
+def cleanup_job(
+  job_name, namespace="default", timeout: float = 180, poll_interval: float = 2
+):
   """Delete completed Kubernetes Job and its pods.
+
+  Blocks until the API confirms the resource is gone (404).
 
   Args:
       job_name: Name of the Kubernetes Job
       namespace: Kubernetes namespace
+      timeout: Maximum seconds to wait for deletion (default 180)
+      poll_interval: Seconds between existence checks (default 2)
   """
-  _load_kube_config()
-  batch_v1 = client.BatchV1Api()
+  batch_v1 = _batch_v1()
 
   try:
     # Delete job with propagation policy to also delete pods
@@ -178,9 +183,105 @@ def cleanup_job(job_name, namespace="default"):
   except ApiException as e:
     if e.status == 404:
       # Job already deleted
-      pass
+      return
     else:
       logging.warning("Failed to delete job %s: %s", job_name, e.reason)
+      return
+
+  # Foreground deletion is async; poll until the resource is gone.
+  max_attempts = max(1, timeout // poll_interval)
+  for _ in range(max_attempts):
+    if not job_exists(job_name, namespace):
+      return
+    time.sleep(poll_interval)
+  logging.warning("Timed out waiting for job %s to be deleted", job_name)
+
+
+def job_exists(job_name, namespace="default") -> bool:
+  """Return whether a namespaced GKE Job currently exists."""
+  batch_v1 = _batch_v1()
+  try:
+    batch_v1.read_namespaced_job_status(job_name, namespace)
+    return True
+  except ApiException as e:
+    if e.status == 404:
+      return False
+    raise RuntimeError(f"Failed to read job status: {e.reason}") from e
+
+
+def get_job_status(job_name, namespace="default") -> JobStatus:
+  """Return the current job status for async observation APIs."""
+  batch_v1 = _batch_v1()
+  core_v1 = _core_v1()
+
+  try:
+    job_status = batch_v1.read_namespaced_job_status(job_name, namespace)
+  except ApiException as e:
+    if e.status == 404:
+      return JobStatus.NOT_FOUND
+    raise RuntimeError(f"Failed to read job status: {e.reason}") from e
+
+  if job_status.status.succeeded and job_status.status.succeeded >= 1:
+    return JobStatus.SUCCEEDED
+  if job_status.status.failed and job_status.status.failed >= 1:
+    return JobStatus.FAILED
+
+  pod = _select_job_pod(core_v1, job_name, namespace)
+
+  if pod is not None and pod.status.phase == "Running":
+    return JobStatus.RUNNING
+  return JobStatus.PENDING
+
+
+def get_job_pod_name(job_name, namespace="default") -> str | None:
+  """Return the most relevant pod name for a GKE Job, if any exists."""
+  core_v1 = _core_v1()
+  pod = _select_job_pod(core_v1, job_name, namespace)
+  if pod is None:
+    return None
+  return pod.metadata.name
+
+
+def get_job_logs(
+  job_name, namespace="default", tail_lines: int | None = None
+) -> str:
+  """Return logs for the active pod of a GKE Job."""
+  core_v1 = _core_v1()
+  pod = _select_job_pod(core_v1, job_name, namespace)
+  if pod is None:
+    raise RuntimeError(f"No pod found for GKE job {job_name}")
+
+  log_kwargs = {}
+  if tail_lines is not None:
+    log_kwargs["tail_lines"] = tail_lines
+  return core_v1.read_namespaced_pod_log(
+    pod.metadata.name,
+    namespace,
+    **log_kwargs,
+  )
+
+
+def list_jobs(namespace="default") -> list[dict[str, str]]:
+  """List live GKE Jobs managed by Kinetic in a namespace."""
+  batch_v1 = _batch_v1()
+  jobs = batch_v1.list_namespaced_job(
+    namespace=namespace,
+    label_selector="app=kinetic",
+  )
+
+  results = []
+  for job in jobs.items:
+    labels = job.metadata.labels or {}
+    job_id = labels.get("job-id")
+    if job_id is None:
+      continue
+    results.append(
+      {
+        "job_id": job_id,
+        "k8s_name": job.metadata.name,
+      }
+    )
+  return results
 
 
 def validate_preflight(
@@ -198,14 +299,13 @@ def validate_preflight(
   Raises:
       RuntimeError: If no nodes match the required accelerator selector.
   """
-  _load_kube_config()
   accel_config = _parse_accelerator(accelerator)
   node_selector = accel_config.get("node_selector")
 
   if not node_selector:
     return  # CPU or no selector required
 
-  core_v1 = client.CoreV1Api()
+  core_v1 = _core_v1()
   try:
     # Construct label selector string: "key1=val1,key2=val2"
     label_selector = ",".join([f"{k}={v}" for k, v in node_selector.items()])
@@ -224,9 +324,9 @@ def validate_preflight(
     logging.warning("Preflight check: Failed to query nodes: %s", e.reason)
 
 
-def _parse_accelerator(accelerator):
+def _parse_accelerator(accelerator, spot=False):
   """Convert accelerator string to GKE pod spec fields."""
-  parsed = accelerators.parse_accelerator(accelerator)
+  parsed = accelerators.parse_accelerator(accelerator, spot=spot)
 
   if parsed is None:
     return {
@@ -238,21 +338,36 @@ def _parse_accelerator(accelerator):
     }
 
   if isinstance(parsed, TpuConfig):
-    return {
+    # For TPU Podslices (multi-node), resource requests must be per-node.
+    # num_nodes is 1 for single-host TPUs (v3-8, v4-8, v5litepod-1/4/8).
+    chips_per_node = parsed.chips // parsed.num_nodes
+    config = {
       "node_selector": {
         "cloud.google.com/gke-tpu-accelerator": parsed.gke_accelerator,
         "cloud.google.com/gke-tpu-topology": parsed.topology,
       },
-      "resource_limits": {"google.com/tpu": str(parsed.chips)},
-      "resource_requests": {"google.com/tpu": str(parsed.chips)},
+      "resource_limits": {"google.com/tpu": str(chips_per_node)},
+      "resource_requests": {"google.com/tpu": str(chips_per_node)},
       "tolerations": [
         {"key": "google.com/tpu", "operator": "Exists", "effect": "NoSchedule"}
       ],
       "jax_platform": "tpu",
     }
 
+    if parsed.spot:
+      config["node_selector"]["cloud.google.com/gke-spot"] = "true"
+      config["tolerations"].append(
+        {
+          "key": "cloud.google.com/gke-spot",
+          "operator": "Equal",
+          "value": "true",
+          "effect": "NoSchedule",
+        }
+      )
+    return config
+
   # GpuConfig
-  return {
+  config = {
     "node_selector": {"cloud.google.com/gke-accelerator": parsed.gke_label},
     "resource_limits": {"nvidia.com/gpu": str(parsed.count)},
     "resource_requests": {"nvidia.com/gpu": str(parsed.count)},
@@ -261,10 +376,22 @@ def _parse_accelerator(accelerator):
     ],
     "jax_platform": "gpu",
   }
+  if parsed.spot:
+    config["node_selector"]["cloud.google.com/gke-spot"] = "true"
+    config["tolerations"].append(
+      {
+        "key": "cloud.google.com/gke-spot",
+        "operator": "Equal",
+        "value": "true",
+        "effect": "NoSchedule",
+      }
+    )
+  return config
 
 
+@functools.lru_cache(maxsize=1)
 def _load_kube_config():
-  """Load Kubernetes configuration.
+  """Load Kubernetes configuration (one-shot, cached).
 
   Attempts to load config in order:
   1. In-cluster config (if running inside K8s)
@@ -290,6 +417,20 @@ def _load_kube_config():
       f"Ensure you have run 'gcloud container clusters get-credentials <cluster-name>' "
       f"or have a valid kubeconfig. Error: {e}"
     ) from e
+
+
+@functools.lru_cache(maxsize=1)
+def _batch_v1():
+  """Return a cached BatchV1Api client, loading kubeconfig on first call."""
+  _load_kube_config()
+  return client.BatchV1Api()
+
+
+@functools.lru_cache(maxsize=1)
+def _core_v1():
+  """Return a cached CoreV1Api client, loading kubeconfig on first call."""
+  _load_kube_config()
+  return client.CoreV1Api()
 
 
 def _create_job_spec(
@@ -330,8 +471,10 @@ def _create_job_spec(
     ],
     env=env_vars,
     resources=client.V1ResourceRequirements(
-      limits=accel_config["resource_limits"],
-      requests=accel_config["resource_requests"],
+      limits={k: str(v) for k, v in accel_config["resource_limits"].items()},
+      requests={
+        k: str(v) for k, v in accel_config["resource_requests"].items()
+      },
     ),
   )
 
@@ -387,16 +530,30 @@ def _create_job_spec(
 def _print_pod_logs(core_v1, job_name, namespace):
   """Print pod logs for debugging failed jobs."""
   with suppress(ApiException):
-    pods = core_v1.list_namespaced_pod(
-      namespace, label_selector=f"job-name={job_name}"
-    )
-
-    for pod in pods.items:
+    for pod in _list_job_pods(core_v1, job_name, namespace):
       with suppress(ApiException):
         logs = core_v1.read_namespaced_pod_log(
           pod.metadata.name, namespace, tail_lines=100
         )
         logging.info("Pod %s logs:\n%s", pod.metadata.name, logs)
+
+
+def _list_job_pods(core_v1, job_name, namespace):
+  pods = core_v1.list_namespaced_pod(
+    namespace, label_selector=f"job-name={job_name}"
+  )
+  return pods.items
+
+
+def _select_job_pod(core_v1, job_name, namespace):
+  pods = _list_job_pods(core_v1, job_name, namespace)
+  for phase in ("Running", "Pending"):
+    for pod in pods:
+      if pod.status.phase == phase:
+        return pod
+  if not pods:
+    return None
+  return pods[0]
 
 
 @functools.lru_cache(maxsize=16)
@@ -436,6 +593,10 @@ def _check_node_pool_exists_cached(selector_items) -> bool:
       config_dict = pool.get("config", {})
       pool_labels = config_dict.get("labels", {}).copy()
 
+      # Spot VM mapping
+      if config_dict.get("spot"):
+        pool_labels["cloud.google.com/gke-spot"] = "true"
+
       # Map GKE injected node labels for accelerators mapping
       accel_config_list = config_dict.get("accelerators", [])
       if accel_config_list:
@@ -444,6 +605,13 @@ def _check_node_pool_exists_cached(selector_items) -> bool:
           pool_labels["cloud.google.com/gke-tpu-accelerator"] = accel_type
         else:
           pool_labels["cloud.google.com/gke-accelerator"] = accel_type
+
+      # TPU topology mapping from placement policy
+      placement_policy = pool.get("placementPolicy", {})
+      if placement_policy and placement_policy.get("tpuTopology"):
+        pool_labels["cloud.google.com/gke-tpu-topology"] = placement_policy[
+          "tpuTopology"
+        ]
 
       # TPU mapping fallback
       machine_type = config_dict.get("machineType", "")
@@ -455,7 +623,9 @@ def _check_node_pool_exists_cached(selector_items) -> bool:
           "goog-gke-accelerator-type"
         ]
 
-      if machine_type.startswith("ct"):
+      if machine_type.startswith("ct") and not pool_labels.get(
+        "cloud.google.com/gke-tpu-topology"
+      ):
         # We roughly map TPU topology presence for preflight
         pool_labels["cloud.google.com/gke-tpu-topology"] = selector.get(
           "cloud.google.com/gke-tpu-topology", ""
@@ -466,7 +636,9 @@ def _check_node_pool_exists_cached(selector_items) -> bool:
       for tpu_spec in accelerators.TPUS.values():
         for chips, topo_spec in tpu_spec.topologies.items():
           if topo_spec.machine_type == machine_type:
-            pool_labels["cloud.google.com/gke-accelerator-count"] = str(chips)
+            pool_labels["cloud.google.com/gke-accelerator-count"] = str(
+              chips // topo_spec.num_nodes
+            )
             break
 
       if all(pool_labels.get(k) == str(v) for k, v in selector.items()):

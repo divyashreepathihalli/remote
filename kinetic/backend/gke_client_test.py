@@ -6,6 +6,7 @@ from unittest import mock
 from unittest.mock import MagicMock
 
 from absl.testing import absltest, parameterized
+from kubernetes.client.rest import ApiException
 from kubernetes.config import ConfigException
 
 from kinetic.backend.gke_client import (
@@ -14,8 +15,16 @@ from kinetic.backend.gke_client import (
   _create_job_spec,
   _load_kube_config,
   _parse_accelerator,
+  get_job_logs,
+  get_job_pod_name,
+  get_job_status,
+  job_exists,
   wait_for_job,
 )
+from kinetic.backend.gke_client import (
+  list_jobs as list_gke_jobs,
+)
+from kinetic.job_status import JobStatus
 
 
 class TestParseAccelerator(absltest.TestCase):
@@ -58,6 +67,15 @@ class TestParseAccelerator(absltest.TestCase):
     self.assertLen(result["tolerations"], 1)
     self.assertEqual(result["tolerations"][0]["key"], "google.com/tpu")
 
+  def test_tpu_v3_16_multi_node(self):
+    # v3-16 has 4 nodes and 16 total chips -> 4 chips per node
+    result = _parse_accelerator("v3-16")
+    self.assertEqual(result["resource_limits"], {"google.com/tpu": "4"})
+    self.assertEqual(result["resource_requests"], {"google.com/tpu": "4"})
+    self.assertEqual(
+      result["node_selector"]["cloud.google.com/gke-tpu-topology"], "4x4"
+    )
+
   def test_tpu_v5litepod_4(self):
     result = _parse_accelerator("v5litepod-4")
     self.assertEqual(
@@ -68,6 +86,38 @@ class TestParseAccelerator(absltest.TestCase):
       },
     )
     self.assertEqual(result["resource_limits"], {"google.com/tpu": "4"})
+
+  def test_spot_gpu(self):
+    result = _parse_accelerator("l4:spot")
+    self.assertEqual(
+      result["node_selector"]["cloud.google.com/gke-spot"], "true"
+    )
+    # Check for spot toleration
+    spot_tol = [
+      t
+      for t in result["tolerations"]
+      if t.get("key") == "cloud.google.com/gke-spot"
+    ]
+    self.assertLen(spot_tol, 1)
+    self.assertEqual(spot_tol[0]["value"], "true")
+
+  def test_spot_tpu(self):
+    result = _parse_accelerator("v6e-8:spot")
+    self.assertEqual(
+      result["node_selector"]["cloud.google.com/gke-spot"], "true"
+    )
+    # Check for spot toleration
+    spot_tol = [
+      t
+      for t in result["tolerations"]
+      if t.get("key") == "cloud.google.com/gke-spot"
+    ]
+    self.assertLen(spot_tol, 1)
+    self.assertEqual(spot_tol[0]["value"], "true")
+    # Should still have TPU toleration
+    self.assertTrue(
+      any(t.get("key") == "google.com/tpu" for t in result["tolerations"])
+    )
 
 
 class TestCreateJobSpec(absltest.TestCase):
@@ -160,9 +210,6 @@ class TestCreateJobSpec(absltest.TestCase):
 class TestWaitForJob(absltest.TestCase):
   def setUp(self):
     super().setUp()
-    self.enterContext(
-      mock.patch("kinetic.backend.gke_client._load_kube_config")
-    )
 
     self.mock_streamer = MagicMock()
     self.enterContext(
@@ -191,11 +238,11 @@ class TestWaitForJob(absltest.TestCase):
 
     with (
       mock.patch(
-        "kinetic.backend.gke_client.client.BatchV1Api",
+        "kinetic.backend.gke_client._batch_v1",
         return_value=mock_batch,
       ),
       mock.patch(
-        "kinetic.backend.gke_client.client.CoreV1Api",
+        "kinetic.backend.gke_client._core_v1",
         return_value=mock_core,
       ),
     ):
@@ -215,11 +262,11 @@ class TestWaitForJob(absltest.TestCase):
 
     with (
       mock.patch(
-        "kinetic.backend.gke_client.client.BatchV1Api",
+        "kinetic.backend.gke_client._batch_v1",
         return_value=mock_batch,
       ),
       mock.patch(
-        "kinetic.backend.gke_client.client.CoreV1Api",
+        "kinetic.backend.gke_client._core_v1",
         return_value=mock_core,
       ),
       self.assertRaisesRegex(RuntimeError, "failed"),
@@ -235,10 +282,10 @@ class TestWaitForJob(absltest.TestCase):
 
     with (
       mock.patch(
-        "kinetic.backend.gke_client.client.BatchV1Api",
+        "kinetic.backend.gke_client._batch_v1",
         return_value=mock_batch,
       ),
-      mock.patch("kinetic.backend.gke_client.client.CoreV1Api"),
+      mock.patch("kinetic.backend.gke_client._core_v1"),
       mock.patch("kinetic.backend.gke_client.time.sleep"),
       self.assertRaisesRegex(RuntimeError, "timed out"),
     ):
@@ -259,11 +306,11 @@ class TestWaitForJob(absltest.TestCase):
 
     with (
       mock.patch(
-        "kinetic.backend.gke_client.client.BatchV1Api",
+        "kinetic.backend.gke_client._batch_v1",
         return_value=mock_batch,
       ),
       mock.patch(
-        "kinetic.backend.gke_client.client.CoreV1Api",
+        "kinetic.backend.gke_client._core_v1",
         return_value=mock_core,
       ),
       mock.patch("kinetic.backend.gke_client.time.sleep") as mock_sleep,
@@ -291,11 +338,11 @@ class TestWaitForJob(absltest.TestCase):
 
     with (
       mock.patch(
-        "kinetic.backend.gke_client.client.BatchV1Api",
+        "kinetic.backend.gke_client._batch_v1",
         return_value=mock_batch,
       ),
       mock.patch(
-        "kinetic.backend.gke_client.client.CoreV1Api",
+        "kinetic.backend.gke_client._core_v1",
         return_value=mock_core,
       ),
       mock.patch("kinetic.backend.gke_client.time.sleep"),
@@ -324,11 +371,11 @@ class TestWaitForJob(absltest.TestCase):
 
     with (
       mock.patch(
-        "kinetic.backend.gke_client.client.BatchV1Api",
+        "kinetic.backend.gke_client._batch_v1",
         return_value=mock_batch,
       ),
       mock.patch(
-        "kinetic.backend.gke_client.client.CoreV1Api",
+        "kinetic.backend.gke_client._core_v1",
         return_value=mock_core,
       ),
       mock.patch("kinetic.backend.gke_client.time.sleep"),
@@ -339,7 +386,160 @@ class TestWaitForJob(absltest.TestCase):
     self.mock_streamer.start.assert_not_called()
 
 
+class TestAsyncObservationHelpers(absltest.TestCase):
+  def setUp(self):
+    super().setUp()
+    self.mock_batch = self.enterContext(
+      mock.patch("kinetic.backend.gke_client._batch_v1")
+    ).return_value
+    self.mock_core = self.enterContext(
+      mock.patch("kinetic.backend.gke_client._core_v1")
+    ).return_value
+
+  def _make_job_status(self, *, succeeded=None, failed=None):
+    job_status = MagicMock()
+    job_status.status.succeeded = succeeded
+    job_status.status.failed = failed
+    return job_status
+
+  def _make_pod(self, phase, name="pod-1"):
+    pod = MagicMock()
+    pod.status.phase = phase
+    pod.metadata.name = name
+    return pod
+
+  def test_get_job_status_succeeded(self):
+    self.mock_batch.read_namespaced_job_status.return_value = (
+      self._make_job_status(succeeded=1)
+    )
+
+    status = get_job_status("kinetic-job-1")
+
+    self.assertEqual(status, JobStatus.SUCCEEDED)
+
+  def test_get_job_status_failed(self):
+    self.mock_batch.read_namespaced_job_status.return_value = (
+      self._make_job_status(failed=1)
+    )
+
+    status = get_job_status("kinetic-job-1")
+
+    self.assertEqual(status, JobStatus.FAILED)
+
+  def test_get_job_status_running(self):
+    self.mock_batch.read_namespaced_job_status.return_value = (
+      self._make_job_status()
+    )
+    self.mock_core.list_namespaced_pod.return_value.items = [
+      self._make_pod("Running")
+    ]
+
+    status = get_job_status("kinetic-job-1")
+
+    self.assertEqual(status, JobStatus.RUNNING)
+
+  def test_get_job_status_pending_when_no_pod_yet(self):
+    self.mock_batch.read_namespaced_job_status.return_value = (
+      self._make_job_status()
+    )
+    self.mock_core.list_namespaced_pod.return_value.items = []
+
+    status = get_job_status("kinetic-job-1")
+
+    self.assertEqual(status, JobStatus.PENDING)
+
+  def test_get_job_status_not_found(self):
+    self.mock_batch.read_namespaced_job_status.side_effect = ApiException(
+      status=404, reason="Not Found"
+    )
+
+    status = get_job_status("kinetic-job-1")
+
+    self.assertEqual(status, JobStatus.NOT_FOUND)
+
+  def test_get_job_pod_name_prefers_running_pod(self):
+    self.mock_core.list_namespaced_pod.return_value.items = [
+      self._make_pod("Pending", name="pending-pod"),
+      self._make_pod("Running", name="running-pod"),
+    ]
+
+    pod_name = get_job_pod_name("kinetic-job-1")
+
+    self.assertEqual(pod_name, "running-pod")
+
+  def test_get_job_logs_reads_selected_pod(self):
+    self.mock_core.list_namespaced_pod.return_value.items = [
+      self._make_pod("Running", name="running-pod")
+    ]
+    self.mock_core.read_namespaced_pod_log.return_value = "log output"
+
+    logs = get_job_logs("kinetic-job-1", tail_lines=20)
+
+    self.assertEqual(logs, "log output")
+    self.mock_core.read_namespaced_pod_log.assert_called_once_with(
+      "running-pod",
+      "default",
+      tail_lines=20,
+    )
+
+  def test_get_job_logs_missing_pod_raises(self):
+    self.mock_core.list_namespaced_pod.return_value.items = []
+
+    with self.assertRaisesRegex(RuntimeError, "No pod found"):
+      get_job_logs("kinetic-job-1")
+
+  def test_job_exists_true(self):
+    self.mock_batch.read_namespaced_job_status.return_value = (
+      self._make_job_status()
+    )
+
+    self.assertTrue(job_exists("kinetic-job-1"))
+
+  def test_job_exists_false_for_404(self):
+    self.mock_batch.read_namespaced_job_status.side_effect = ApiException(
+      status=404, reason="Not Found"
+    )
+
+    self.assertFalse(job_exists("kinetic-job-1"))
+
+  def test_job_exists_raises_on_non_404(self):
+    self.mock_batch.read_namespaced_job_status.side_effect = ApiException(
+      status=500, reason="Internal Server Error"
+    )
+
+    with self.assertRaisesRegex(RuntimeError, "Failed to read job status"):
+      job_exists("kinetic-job-1")
+
+  def test_list_jobs_returns_labelled_jobs(self):
+    job_with_label = MagicMock()
+    job_with_label.metadata.labels = {"job-id": "job-1"}
+    job_with_label.metadata.name = "kinetic-job-1"
+    job_without_label = MagicMock()
+    job_without_label.metadata.labels = {}
+    job_without_label.metadata.name = "ignored"
+    self.mock_batch.list_namespaced_job.return_value.items = [
+      job_with_label,
+      job_without_label,
+    ]
+
+    jobs = list_gke_jobs("team-ns")
+
+    self.assertEqual(
+      jobs,
+      [{"job_id": "job-1", "k8s_name": "kinetic-job-1"}],
+    )
+    self.mock_batch.list_namespaced_job.assert_called_once_with(
+      namespace="team-ns",
+      label_selector="app=kinetic",
+    )
+
+
 class TestLoadKubeConfig(absltest.TestCase):
+  def setUp(self):
+    super().setUp()
+    _load_kube_config.cache_clear()
+    self.addCleanup(_load_kube_config.cache_clear)
+
   def test_kubeconfig_fallback(self):
     """Falls back to local kubeconfig when in-cluster config is unavailable."""
     with (
@@ -411,6 +611,29 @@ class TestCheckNodePoolExistsCached(absltest.TestCase):
       (
         ("cloud.google.com/gke-tpu-accelerator", "tpu-v5-lite-podslice"),
         ("cloud.google.com/gke-tpu-topology", "2x2"),
+      )
+    )
+    self.assertTrue(result)
+
+  def test_tpu_multi_node_match(self):
+    """Test that it correctly identifies a 4-chip-per-node pool for v6e-16."""
+    self.mock_run.return_value = json.dumps(
+      [
+        {
+          "config": {
+            "machineType": "ct6e-standard-4t",
+            "accelerators": [{"acceleratorType": "tpu-v6e-slice"}],
+            "labels": {},
+          }
+        }
+      ]
+    )
+
+    result = _check_node_pool_exists_cached(
+      (
+        ("cloud.google.com/gke-tpu-accelerator", "tpu-v6e-slice"),
+        ("cloud.google.com/gke-tpu-topology", "4x4"),
+        ("cloud.google.com/gke-accelerator-count", "4"),
       )
     )
     self.assertTrue(result)

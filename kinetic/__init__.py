@@ -12,7 +12,11 @@ from rich.console import Console
 from rich.logging import RichHandler
 
 from kinetic.core.core import run as run
+from kinetic.core.core import submit as submit
 from kinetic.data import Data as Data
+from kinetic.jobs import JobHandle as JobHandle
+from kinetic.jobs import attach as attach
+from kinetic.jobs import list_jobs as list_jobs
 
 logging.use_absl_handler()
 
@@ -33,7 +37,7 @@ absl_logger.propagate = False
 
 # Default to INFO if the user is running a script outside of absl.app.run()
 # This ensures that operations like container building and job status are visible.
-log_level = os.environ.get("KERAS_REMOTE_LOG_LEVEL", "INFO").upper()
+log_level = os.environ.get("KINETIC_LOG_LEVEL", "INFO").upper()
 
 if log_level == "DEBUG":
   logging.set_verbosity(logging.DEBUG)

@@ -8,14 +8,14 @@ Run Keras and JAX workloads on cloud TPUs and GPUs with a simple decorator. No i
 ```python
 import kinetic
 
-@kinetic.run(accelerator="v6e-8")
+@kinetic.run(accelerator="v5e-1")
 def train_model():
     import keras
     model = keras.Sequential([...])
     model.fit(x_train, y_train)
     return model.history.history["loss"][-1]
 
-# Executes on TPU v6e-8, returns the result
+# Executes on TPU v5e-1, returns the result
 final_loss = train_model()
 ```
 
@@ -46,6 +46,7 @@ You need a GKE cluster with accelerator node pools to run jobs. The `kinetic` CL
 ## Features
 
 - **Simple decorator API** — Add `@kinetic.run()` to any function to execute it remotely
+- **Detached execution** — Use `@kinetic.submit()` to launch work, reattach later, and collect results when convenient
 - **Automatic infrastructure** — No manual VM provisioning or teardown required
 - **Result serialization** — Functions return actual values, not just logs
 - **Fast iteration** — Container images are cached by dependency hash; unchanged dependencies skip the build entirely (subsequent runs start in less than a minute)
@@ -60,6 +61,7 @@ You need a GKE cluster with accelerator node pools to run jobs. The `kinetic` CL
 ### Prerequisites
 
 - Python 3.11+
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) — fast Python package installer
 - Google Cloud SDK (`gcloud`) — [install guide](https://cloud.google.com/sdk/docs/install)
 - A Google Cloud project with billing enabled
 
@@ -75,14 +77,10 @@ gcloud auth application-default login
 ### Install
 
 ```bash
-git clone https://github.com/keras-team/kinetic.git
-cd kinetic
-pip install -e ".[cli]"
+uv pip install keras-kinetic
 ```
 
 This installs both the `@kinetic.run()` decorator and the `kinetic` CLI for managing infrastructure.
-
-> If your GKE cluster and Artifact Registry are already provisioned, you can install without the CLI: `pip install -e .`
 
 ### Provision Infrastructure
 
@@ -122,7 +120,7 @@ Add this to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) to persist it. Se
 ```python
 import kinetic
 
-@kinetic.run(accelerator="v6e-8")
+@kinetic.run(accelerator="v5e-1")
 def hello_tpu():
     import jax
     return f"Running on {jax.devices()}"
@@ -140,7 +138,7 @@ print(result)
 ```python
 import kinetic
 
-@kinetic.run(accelerator="v6e-8")
+@kinetic.run(accelerator="v5e-1")
 def train_model():
     import keras
     import numpy as np
@@ -160,6 +158,124 @@ def train_model():
 final_loss = train_model()
 print(f"Final loss: {final_loss}")
 ```
+
+### Async Jobs
+
+`@kinetic.run()` blocks until the remote function finishes and returns the result inline — convenient for interactive work, but limiting when jobs take hours or you want to launch several in parallel. `@kinetic.submit()` is the async counterpart: it launches the job, returns a `JobHandle` immediately, and lets you check status, stream logs, collect the result, or reattach from a completely different session whenever you're ready.
+
+The two decorators accept the same parameters, so switching between them is a one-word change.
+
+#### Submitting a Job
+
+```python
+import kinetic
+import time
+
+@kinetic.submit(accelerator="v5e-1")
+def train_model():
+    time.sleep(60)
+    return {"loss": 0.1}
+
+# Returns a JobHandle immediately — does not wait for the job to finish
+job = train_model()
+print(job.job_id)       # e.g. "job-a1b2c3d4"
+print(job.func_name)    # "train_model"
+print(job.accelerator)  # "v6e-8"
+```
+
+#### Monitoring Status and Logs
+
+```python
+# Poll the current status
+status = job.status()  # PENDING → RUNNING → SUCCEEDED or FAILED
+print(status.value)
+
+# Grab the last N log lines from the active pod
+print(job.tail(20))
+
+# Or fetch the full log as a string
+full_log = job.logs()
+
+# Stream logs in real time (blocks until the job finishes)
+job.logs(follow=True)
+```
+
+`JobStatus` values: `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `NOT_FOUND`.
+
+#### Collecting the Result
+
+```python
+# Block until the job completes and return its value
+metrics = job.result()   # {"loss": 0.1}
+
+# With a timeout (raises TimeoutError if exceeded, but the job keeps running)
+metrics = job.result(timeout=600)
+```
+
+By default, `result()` cleans up the Kubernetes resource and GCS artifacts after downloading the return value. Pass `cleanup=False` to keep them around for inspection.
+
+If the remote function raises an exception, `result()` re-raises it locally with the original traceback attached.
+
+#### Running Multiple Jobs Concurrently
+
+Because `submit()` returns immediately, you can launch several jobs and collect results later:
+
+```python
+@kinetic.submit(accelerator="cpu")
+def train_model_a():
+    ...
+
+@kinetic.submit(accelerator="cpu")
+def train_model_b():
+    ...
+
+job_a = train_model_a()
+job_b = train_model_b()
+
+# Both are running in parallel — collect when ready
+loss_a = job_a.result(cleanup=False)
+loss_b = job_b.result(cleanup=False)
+```
+
+#### Reattaching to a Job
+
+You can reconnect to a running (or finished) job from a different Python session, shell, or machine — all you need is the job ID and access to the same GCP project:
+
+```python
+job = kinetic.attach(
+    job_id="job-a1b2c3d4",
+    project="my-project",   # optional if KINETIC_PROJECT is set
+    cluster="kinetic-cluster",  # optional if KINETIC_CLUSTER is set
+)
+
+print(job.status().value)
+metrics = job.result()
+```
+
+#### Listing Jobs
+
+Discover all live Kinetic jobs on the cluster:
+
+```python
+for job in kinetic.list_jobs(project="my-project", cluster="kinetic-cluster"):
+    print(job.job_id, job.func_name, job.status().value)
+```
+
+Both `project` and `cluster` are optional when the corresponding environment variables are set.
+
+#### Cancelling and Cleaning Up
+
+```python
+# Cancel a running job (deletes the Kubernetes resource)
+job.cancel()
+
+# Explicitly clean up Kubernetes resources and/or GCS artifacts
+job.cleanup(k8s=True, gcs=True)
+```
+
+#### CLI
+
+Async jobs can also be managed from the terminal — see [`kinetic jobs`](#kinetic-jobs) in the CLI reference below.
 
 ### Working with Data
 
@@ -185,7 +301,7 @@ import pandas as pd
 import kinetic
 from kinetic import Data
 
-@kinetic.run(accelerator="v6e-8")
+@kinetic.run(accelerator="v5e-1")
 def train(data_dir):
     # data_dir is resolved to a local path on the remote machine
     df = pd.read_csv(f"{data_dir}/train.csv")
@@ -212,7 +328,7 @@ import kinetic
 from kinetic import Data
 
 @kinetic.run(
-    accelerator="v6e-8",
+    accelerator="v5e-1",
     volumes={
         "/data": Data("./my_dataset/"),
         "/weights": Data("gs://my-bucket/pretrained-weights/")
@@ -236,7 +352,7 @@ If your dataset is very large (e.g., > 10GB), it is inefficient to download the 
 import grain.python as grain
 import kinetic
 
-@kinetic.run(accelerator="v6e-8")
+@kinetic.run(accelerator="v5e-1")
 def train(data_uri):
     # Native GCS reading, no download overhead
     data_source = grain.ArrayRecordDataSource(data_uri)
@@ -270,7 +386,7 @@ dependencies = [
 Kinetic automatically detects and installs dependencies on the remote worker.
 If both files exist in the same directory, `requirements.txt` takes precedence.
 
-> **Note:** JAX packages (`jax`, `jaxlib`, `libtpu`, `libtpu-nightly`) are automatically filtered from your dependencies to prevent overriding the accelerator-specific JAX installation. To keep a JAX line, append `# kr:keep` to it.
+> **Note:** JAX packages (`jax`, `jaxlib`, `libtpu`, `libtpu-nightly`) are automatically filtered from your dependencies to prevent overriding the accelerator-specific JAX installation. To keep a JAX line, append `# kn:keep` to it.
 
 ### Prebuilt Container Images
 
@@ -278,7 +394,7 @@ Skip container build time by using prebuilt images:
 
 ```python
 @kinetic.run(
-    accelerator="v6e-8",
+    accelerator="v5e-1",
     container_image="us-docker.pkg.dev/my-project/kinetic/prebuilt:v1.0"
 )
 def train():
@@ -325,7 +441,7 @@ You can run multiple independent clusters within the same GCP project — for ex
 
 ```bash
 # Default cluster (named "kinetic-cluster")
-kinetic up --project=my-project --accelerator=v6e-8
+kinetic up --project=my-project --accelerator=v5e-1
 
 # A separate GPU cluster
 kinetic up --project=my-project --cluster=gpu-cluster --accelerator=a100
@@ -362,13 +478,13 @@ For more examples, see the [`examples/`](examples/) directory.
 
 #### Environment Variables
 
-| Variable                     | Required | Default                | Description                                                  |
-| ---------------------------- | -------- | ---------------------- | ------------------------------------------------------------ |
-| `KINETIC_PROJECT`       | Yes      | —                      | Google Cloud project ID                                      |
-| `KINETIC_ZONE`          | No       | `us-central1-a`        | Default compute zone                                         |
-| `KINETIC_CLUSTER`       | No       | `kinetic-cluster` | GKE cluster name                                             |
-| `KINETIC_NAMESPACE`     | No       | `default`              | Kubernetes namespace                                         |
-| `KINETIC_LOG_LEVEL`     | No       | `INFO`                 | Log verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `FATAL`) |
+| Variable            | Required | Default           | Description                                                  |
+| ------------------- | -------- | ----------------- | ------------------------------------------------------------ |
+| `KINETIC_PROJECT`   | Yes      | —                 | Google Cloud project ID                                      |
+| `KINETIC_ZONE`      | No       | `us-central1-a`   | Default compute zone                                         |
+| `KINETIC_CLUSTER`   | No       | `kinetic-cluster` | GKE cluster name                                             |
+| `KINETIC_NAMESPACE` | No       | `default`         | Kubernetes namespace                                         |
+| `KINETIC_LOG_LEVEL` | No       | `INFO`            | Log verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `FATAL`) |
 
 Kinetic uses `absl-py` for logging. Set `KINETIC_LOG_LEVEL=DEBUG` for verbose output when debugging issues.
 
@@ -376,7 +492,7 @@ Kinetic uses `absl-py` for logging. Set `KINETIC_LOG_LEVEL=DEBUG` for verbose ou
 
 ```python
 @kinetic.run(
-    accelerator="v6e-8",       # TPU/GPU type (default: "v6e-8")
+    accelerator="v5e-1",       # TPU/GPU type (default: "v5e-1")
     container_image=None,      # Custom container URI
     zone=None,                 # Override default zone
     project=None,              # Override default project
@@ -423,7 +539,7 @@ Use `accelerator="cpu"` to run on a CPU-only node (no accelerator attached).
 
 ### CLI Commands
 
-The `kinetic` CLI manages your cloud infrastructure. Install it with `pip install -e ".[cli]"`.
+The `kinetic` CLI manages your cloud infrastructure. Install it with `uv pip install keras-kinetic[cli]`.
 
 #### `kinetic up`
 
@@ -467,7 +583,7 @@ Manage accelerator node pools after initial setup:
 
 ```bash
 # Add a node pool for a specific accelerator
-kinetic pool add --accelerator=v6e-8
+kinetic pool add --accelerator=v5e-1
 
 # List current node pools
 kinetic pool list
@@ -475,6 +591,65 @@ kinetic pool list
 # Remove a node pool by name
 kinetic pool remove <pool-name>
 ```
+
+#### `kinetic jobs`
+
+Inspect and manage async jobs submitted with `@kinetic.submit()`. All subcommands accept `--project`, `--zone`, and `--cluster` overrides (or read from the corresponding environment variables).
+
+**List** all live jobs on the cluster:
+
+```bash
+kinetic jobs list
+```
+
+**Status** of a specific job:
+
+```bash
+kinetic jobs status <job-id>
+```
+
+**Logs** — fetch the full log, the last N lines, or stream in real time:
+
+```bash
+kinetic jobs logs <job-id>              # full log
+kinetic jobs logs <job-id> --tail 100   # last 100 lines
+kinetic jobs logs <job-id> --follow     # stream until completion
+```
+
+`--follow` and `--tail` are mutually exclusive.
+
+**Result** — block until the job completes and print its return value:
+
+```bash
+kinetic jobs result <job-id>
+kinetic jobs result <job-id> --timeout 600    # give up after 10 min
+kinetic jobs result <job-id> --no-cleanup     # keep k8s/GCS artifacts
+```
+
+**Cancel** a running job (deletes the Kubernetes resource):
+
+```bash
+kinetic jobs cancel <job-id>
+```
+
+**Cleanup** Kubernetes resources and/or GCS artifacts for a finished job:
+
+```bash
+kinetic jobs cleanup <job-id>
+kinetic jobs cleanup <job-id> --no-k8s   # only delete GCS artifacts
+kinetic jobs cleanup <job-id> --no-gcs   # only delete k8s resources
+```
+
+#### `kinetic doctor`
+
+Diagnose environment, credentials, and infrastructure issues:
+
+```bash
+kinetic doctor
+kinetic doctor --project=my-project --zone=us-central2-b
+```
+
+Runs read-only checks across seven categories — local tools, authentication, configuration, GCP project access, GCP APIs, infrastructure, and Kubernetes — and reports actionable fix hints for any failures. Exits with code 1 if any check fails.
 
 ### Monitoring
 
@@ -536,7 +711,15 @@ gcloud builds list --project=$KINETIC_PROJECT --limit=5
 
 ### Verify Setup
 
-Run `kinetic status` to check the health of your infrastructure. For manual verification:
+Run `kinetic doctor` for a comprehensive diagnostic of your environment, credentials, and infrastructure:
+
+```bash
+kinetic doctor
+```
+
+This checks local tools, authentication, GCP project access, required APIs, cluster health, Kubernetes connectivity, and more — with actionable fix suggestions for any issues found.
+
+For quick infrastructure state, use `kinetic status`. For manual verification:
 
 ```bash
 # Check authentication

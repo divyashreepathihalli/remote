@@ -9,21 +9,56 @@ def common_options(f):
   """Shared --project, --zone, --cluster options for subcommands."""
   f = click.option(
     "--project",
-    envvar="KERAS_REMOTE_PROJECT",
+    envvar="KINETIC_PROJECT",
     default=None,
-    help="GCP project ID [env: KERAS_REMOTE_PROJECT]",
+    help="GCP project ID [env: KINETIC_PROJECT]",
   )(f)
   f = click.option(
     "--zone",
-    envvar="KERAS_REMOTE_ZONE",
+    envvar="KINETIC_ZONE",
     default=None,
-    help=f"GCP zone [env: KERAS_REMOTE_ZONE, default: {DEFAULT_ZONE}]",
+    help=f"GCP zone [env: KINETIC_ZONE, default: {DEFAULT_ZONE}]",
   )(f)
   f = click.option(
     "--cluster",
     "cluster_name",
-    envvar="KERAS_REMOTE_CLUSTER",
+    envvar="KINETIC_CLUSTER",
     default=None,
     help=f"GKE cluster name [default: {DEFAULT_CLUSTER_NAME}]",
+  )(f)
+  return f
+
+
+def cleanup_options(f):
+  """Shared --cleanup-timeout and --cleanup-poll-interval options."""
+  f = click.option(
+    "--cleanup-timeout",
+    type=float,
+    default=180,
+    show_default=True,
+    help="Maximum seconds to wait for k8s resource deletion.",
+  )(f)
+  f = click.option(
+    "--cleanup-poll-interval",
+    type=float,
+    default=2,
+    show_default=True,
+    help="Seconds between k8s deletion-confirmation polls.",
+  )(f)
+  return f
+
+
+def jobs_options(f):
+  """Shared options for ``kinetic jobs`` subcommands.
+
+  Extends ``common_options`` with ``--namespace``.
+  """
+  f = common_options(f)
+  f = click.option(
+    "--namespace",
+    envvar="KINETIC_NAMESPACE",
+    default="default",
+    show_default=True,
+    help="Kubernetes namespace [env: KINETIC_NAMESPACE]",
   )(f)
   return f

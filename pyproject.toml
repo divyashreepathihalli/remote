@@ -39,6 +39,7 @@ test = [
 dev = [
     "pre-commit",
     "ruff",
+    "kinetic[cli]",
     "kinetic[test]",
 ]
 demo = [
@@ -46,6 +47,13 @@ demo = [
     "keras",
     "numpy",
     "keras-hub",
+]
+docs = [
+    "myst_nb",
+    "sphinx",
+    "sphinx_autobuild",
+    "sphinx_book_theme",
+    "sphinx-click",
 ]
 
 [project.scripts]
