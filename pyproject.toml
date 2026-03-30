@@ -39,6 +39,7 @@ test = [
 dev = [
     "pre-commit",
     "ruff",
+    "kinetic[cli]",
     "kinetic[test]",
 ]
 demo = [
