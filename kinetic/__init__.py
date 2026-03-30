@@ -17,6 +17,8 @@ from kinetic.data import Data as Data
 from kinetic.jobs import JobHandle as JobHandle
 from kinetic.jobs import attach as attach
 from kinetic.jobs import list_jobs as list_jobs
+from kinetic.version import __version__ as __version__
+from kinetic.version import version as version
 
 logging.use_absl_handler()
 
