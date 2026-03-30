@@ -39,8 +39,8 @@ test = [
 dev = [
     "pre-commit",
     "ruff",
-    "kinetic[cli]",
-    "kinetic[test]",
+    "keras-kinetic[cli]",
+    "keras-kinetic[test]",
 ]
 demo = [
     "jax",
