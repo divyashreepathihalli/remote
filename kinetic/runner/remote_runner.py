@@ -5,6 +5,7 @@ This script runs on the remote TPU/GPU and executes the user's function.
 Artifacts are downloaded from and uploaded to Cloud Storage (GCS).
 """
 
+import inspect
 import os
 import pickle
 import shutil
@@ -12,7 +13,6 @@ import sys
 import tempfile
 import traceback
 import zipfile
-import inspect
 
 import cloudpickle
 from absl import logging
@@ -89,7 +89,6 @@ def main():
     args, kwargs = resolve_data_refs(args, kwargs, storage_client)
 
     # Check if function accepts start_step
-    
 
     sig = inspect.signature(func)
     if "start_step" in sig.parameters:
