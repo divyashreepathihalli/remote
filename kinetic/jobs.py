@@ -5,6 +5,7 @@ remote jobs submitted via `kinetic.submit()`.  Includes `attach()`
 for cross-session reattachment and `list_jobs()` for discovery.
 """
 
+import contextlib
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -27,6 +28,11 @@ from kinetic.constants import (
 from kinetic.credentials import ensure_credentials
 from kinetic.job_status import JobStatus  # re-export
 from kinetic.utils import storage
+
+_BACKEND_CLIENTS = {
+  "gke": gke_client,
+  "pathways": pathways_client,
+}
 
 _RESULT_POLL_INTERVAL_SECONDS = 5
 _RESULT_DOWNLOAD_BACKOFF_SECONDS = (0, 1, 2, 4, 8, 16)
@@ -143,52 +149,39 @@ class JobHandle:
   # Internal helpers
   # ------------------------------------------------------------------
 
-  def _get_status(self) -> JobStatus:
-    """Return the backend job status."""
+  @property
+  def _client(self):
+    """Return the backend client module for this handle's backend."""
+    try:
+      return _BACKEND_CLIENTS[self.backend]
+    except KeyError:
+      raise ValueError(f"Unknown backend: {self.backend}") from None
+
+  def _ensure_credentials(self) -> None:
     ensure_credentials(
       project=self.project, zone=self.zone, cluster=self.cluster_name
     )
-    if self.backend == "gke":
-      return gke_client.get_job_status(self.k8s_name, namespace=self.namespace)
-    if self.backend == "pathways":
-      return pathways_client.get_job_status(
-        self.k8s_name, namespace=self.namespace
-      )
-    raise ValueError(f"Unknown backend: {self.backend}")
+
+  def _get_status(self) -> JobStatus:
+    """Return the backend job status."""
+    self._ensure_credentials()
+    return self._client.get_job_status(self.k8s_name, namespace=self.namespace)
 
   def _get_pod_name(self) -> str | None:
     """Return the pod name used for log retrieval, if it exists."""
-    ensure_credentials(
-      project=self.project, zone=self.zone, cluster=self.cluster_name
+    self._ensure_credentials()
+    return self._client.get_job_pod_name(
+      self.k8s_name, namespace=self.namespace
     )
-    if self.backend == "gke":
-      return gke_client.get_job_pod_name(
-        self.k8s_name, namespace=self.namespace
-      )
-    if self.backend == "pathways":
-      return pathways_client.get_job_pod_name(
-        self.k8s_name, namespace=self.namespace
-      )
-    raise ValueError(f"Unknown backend: {self.backend}")
 
   def _get_logs(self, tail_lines: int | None = None) -> str:
     """Return log text for this job."""
-    ensure_credentials(
-      project=self.project, zone=self.zone, cluster=self.cluster_name
+    self._ensure_credentials()
+    return self._client.get_job_logs(
+      self.k8s_name,
+      namespace=self.namespace,
+      tail_lines=tail_lines,
     )
-    if self.backend == "gke":
-      return gke_client.get_job_logs(
-        self.k8s_name,
-        namespace=self.namespace,
-        tail_lines=tail_lines,
-      )
-    if self.backend == "pathways":
-      return pathways_client.get_job_logs(
-        self.k8s_name,
-        namespace=self.namespace,
-        tail_lines=tail_lines,
-      )
-    raise ValueError(f"Unknown backend: {self.backend}")
 
   def _cleanup_k8s_resource(
     self,
@@ -196,26 +189,13 @@ class JobHandle:
     poll_interval: float = 2,
   ) -> None:
     """Delete the backend-specific Kubernetes resource if it exists."""
-    ensure_credentials(
-      project=self.project, zone=self.zone, cluster=self.cluster_name
+    self._ensure_credentials()
+    self._client.cleanup_job(
+      self.k8s_name,
+      namespace=self.namespace,
+      timeout=timeout,
+      poll_interval=poll_interval,
     )
-    if self.backend == "gke":
-      gke_client.cleanup_job(
-        self.k8s_name,
-        namespace=self.namespace,
-        timeout=timeout,
-        poll_interval=poll_interval,
-      )
-      return
-    if self.backend == "pathways":
-      pathways_client.cleanup_job(
-        self.k8s_name,
-        namespace=self.namespace,
-        timeout=timeout,
-        poll_interval=poll_interval,
-      )
-      return
-    raise ValueError(f"Unknown backend: {self.backend}")
 
   def _download_result_payload(self) -> dict[str, Any]:
     """Download and deserialize the remote result payload."""
@@ -263,6 +243,7 @@ class JobHandle:
 
   def _stream_logs(self) -> None:
     """Stream logs to stdout via LogStreamer (blocking)."""
+    self._ensure_credentials()
     core_v1 = client.CoreV1Api()
     pod_name = self._get_pod_name()
     if pod_name is None:
@@ -300,6 +281,7 @@ class JobHandle:
     cleanup: bool = True,
     cleanup_timeout: float = 180,
     cleanup_poll_interval: float = 2,
+    stream_logs: bool = False,
   ) -> Any:
     """Wait for the job result and return it or re-raise the user exception.
 
@@ -314,6 +296,8 @@ class JobHandle:
         deletion to be confirmed.
       cleanup_poll_interval: Seconds between deletion-confirmation
         polls.
+      stream_logs: When *True*, stream live pod logs to the terminal
+        while waiting for the job to complete.
 
     Returns:
       The function's return value.
@@ -325,16 +309,30 @@ class JobHandle:
     """
     deadline = None if timeout is None else time.monotonic() + timeout
     observed_status = None
+    streamer_ctx = None
 
-    while True:
-      observed_status = self.status()
-      if observed_status in _TERMINAL_STATUSES:
-        break
-      if deadline is not None and time.monotonic() >= deadline:
-        raise TimeoutError(
-          f"Timed out waiting for job {self.job_id} after {timeout}s"
-        )
-      time.sleep(_RESULT_POLL_INTERVAL_SECONDS)
+    if stream_logs:
+      self._ensure_credentials()
+      streamer_ctx = LogStreamer(client.CoreV1Api(), self.namespace)
+
+    with streamer_ctx if streamer_ctx is not None else contextlib.nullcontext():
+      while True:
+        observed_status = self.status()
+        if observed_status in _TERMINAL_STATUSES:
+          break
+        if deadline is not None and time.monotonic() >= deadline:
+          raise TimeoutError(
+            f"Timed out waiting for job {self.job_id} after {timeout}s"
+          )
+        if (
+          streamer_ctx is not None
+          and streamer_ctx._thread is None
+          and observed_status == JobStatus.RUNNING
+        ):
+          pod_name = self._get_pod_name()
+          if pod_name is not None:
+            streamer_ctx.start(pod_name)
+        time.sleep(_RESULT_POLL_INTERVAL_SECONDS)
 
     result_payload = None
     try:

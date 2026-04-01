@@ -6,6 +6,7 @@ Artifacts are downloaded from and uploaded to Cloud Storage (GCS).
 """
 
 import os
+import pickle
 import shutil
 import sys
 import tempfile
@@ -36,22 +37,11 @@ def main():
     )
     sys.exit(1)
 
-  run_gcs_mode()
-
-
-def run_gcs_mode():
-  """Execute with Cloud Storage artifacts.
-
-  Args from sys.argv:
-      sys.argv[1]: GCS path to context.zip
-      sys.argv[2]: GCS path to payload.pkl
-      sys.argv[3]: GCS path to result.pkl (output)
-  """
   context_gcs = sys.argv[1]
   payload_gcs = sys.argv[2]
   result_gcs = sys.argv[3]
 
-  logging.info("Starting GCS execution mode")
+  logging.info("Starting remote execution")
 
   # Define local paths using tempfile
   context_path = os.path.join(TEMP_DIR, "context.zip")
@@ -125,8 +115,21 @@ def run_gcs_mode():
       "traceback": remote_traceback,
     }
 
-    with open(result_path, "wb") as f:
-      cloudpickle.dump(result_payload, f)
+    try:
+      with open(result_path, "wb") as f:
+        cloudpickle.dump(result_payload, f)
+    except (pickle.PicklingError, TypeError) as serialize_err:
+      logging.error("Failed to serialize result: %s", serialize_err)
+      fallback_payload = {
+        "success": False,
+        "result": None,
+        "exception": RuntimeError(
+          f"Result serialization failed: {serialize_err}"
+        ),
+        "traceback": remote_traceback,
+      }
+      with open(result_path, "wb") as f:
+        cloudpickle.dump(fallback_payload, f)
 
     # Upload result to Cloud Storage
     logging.info("Uploading result...")
