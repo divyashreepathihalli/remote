@@ -5,7 +5,6 @@ This script runs on the remote TPU/GPU and executes the user's function.
 Artifacts are downloaded from and uploaded to Cloud Storage (GCS).
 """
 
-
 import os
 import pickle
 import shutil
@@ -87,8 +86,6 @@ def main():
     if volumes:
       resolve_volumes(volumes, storage_client)
     args, kwargs = resolve_data_refs(args, kwargs, storage_client)
-
-
 
     # Execute function and capture result
     logging.info("Executing %s()", func.__name__)
@@ -273,9 +270,6 @@ def _upload_to_gcs(client, local_path, gcs_path):
   bucket = client.bucket(bucket_name)
   blob = bucket.blob(blob_path)
   blob.upload_from_filename(local_path)
-
-
-
 
 
 if __name__ == "__main__":
